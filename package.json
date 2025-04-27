@@ -1,0 +1,17 @@
+{
+  "name": "audio-merge-service",
+  "version": "1.0.0",
+  "description": "A simple service to merge audio files using FFmpeg.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.17.1",
+    "multer": "^1.4.2",
+    "util": "^0.12.4"
+  },
+  "devDependencies": {},
+  "author": "",
+  "license": "ISC"
+}
