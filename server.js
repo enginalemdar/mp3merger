@@ -11,33 +11,25 @@ const execPromise = util.promisify(exec);
 const app = express();
 const port = process.env.PORT || 3000; // Railway genellikle PORT environment değişkenini kullanır
 
+// ... (önceki importlar ve ayarlamalar aynı) ...
+
 // Dosyaları geçici olarak saklamak için multer yapılandırması
-// os.tmpdir() sistemi geçici dizinini kullanır
+// **Limit kaldırıldı:** upload.array('files', 2) yerine upload.array('files')
 const upload = multer({ dest: os.tmpdir() });
 
-// POST /merge endpoint'i
-// 'files' alan adıyla en fazla 2 dosya bekliyoruz
-app.post('/merge', upload.array('files', 2), async (req, res) => {
+// POST /merge endpoint'i - **Şimdi kaç dosya gelirse gelsin 'files' alan adıyla hepsini kabul eder**
+app.post('/merge', upload.array('files'), async (req, res) => {
     console.log('Merge isteği alındı.');
 
-    // Multer yüklenen dosyaları req.files dizisine koyar
-    const inputFiles = req.files;
+    const inputFiles = req.files; // Gelen tüm dosyalar burada bir dizi olarak bulunur
 
-    if (!inputFiles || inputFiles.length !== 2) {
-        // Eğer 2 dosya yüklenmediyse hata döndür
-        const errorMsg = "Lütfen tam olarak 2 adet MP3 dosyası yükleyin.";
+    // **Dosya sayısı kontrolü değiştirildi:** Şimdi en az bir dosya kontrolü yapıyoruz
+    if (!inputFiles || inputFiles.length === 0) {
+        const errorMsg = "Lütfen en az bir adet MP3 dosyası yükleyin.";
         console.error(errorMsg);
-        // Yüklenen geçici dosyaları temizle
-        if (inputFiles) {
-             for (const file of inputFiles) {
-                try { await fs.unlink(file.path); } catch (e) { console.warn(`Temp file cleanup failed: ${file.path}`, e); }
-            }
-        }
         return res.status(400).send(errorMsg);
     }
-
-    const inputFile1Path = inputFiles[0].path;
-    const inputFile2Path = inputFiles[1].path;
+    // Tam olarak 2 dosya olma zorunluluğu kalktı
 
     const tmpDir = os.tmpdir();
     const timestamp = Date.now();
@@ -45,67 +37,52 @@ app.post('/merge', upload.array('files', 2), async (req, res) => {
     const outputFileName = `merged_audio_${timestamp}.mp3`;
     const outputFilePath = path.join(tmpDir, outputFileName);
 
-    // Temizlenecek tüm geçici dosyalar
-    const filesToClean = [inputFile1Path, inputFile2Path, listFilePath, outputFilePath];
+    // Temizlenecek tüm geçici dosyalar: Yüklenenler, liste dosyası ve çıktı dosyası
+    const filesToClean = inputFiles.map(f => f.path).concat([listFilePath, outputFilePath]);
 
     try {
-        // FFmpeg concat list dosyasını oluştur
-        // Dosya yollarını 'file ' komutu ile listeleyin
-        const listContent = `file '${inputFile1Path.replace(/\\/g, '/')}'\nfile '${inputFile2Path.replace(/\\/g, '/')}'`; // Windows yolları için ters eğik çizgileri düzelt
+        // **FFmpeg concat list dosyasını oluştur - Gelen her dosya için bir satır**
+        // inputFiles dizisindeki her dosyanın yolunu alıp 'file ' ile başlayan bir satır oluştur
+        const listContent = inputFiles.map(file => `file '${file.path.replace(/\\/g, '/')}'`).join('\n');
         await fs.writeFile(listFilePath, listContent);
         console.log(`Concat list dosyası oluşturuldu: ${listFilePath}`);
 
-        // FFmpeg birleştirme komutunu oluştur
-        // -y: Çıktı varsa üzerine yaz
-        // -f concat: concat demuxer kullan
-        // -safe 0: Liste dosyasındaki güvenli olmayan yollara izin ver
-        // -i "${listFilePath}": Girdi olarak listeyi kullan
-        // -c copy: Kodekleri kopyala (hızlı ve kayıpsız)
+        // FFmpeg birleştirme komutu aynı kalır
         const ffmpegCommand = `ffmpeg -y -f concat -safe 0 -i "${listFilePath.replace(/\\/g, '/')}" -c copy "${outputFilePath.replace(/\\/g, '/')}"`;
 
         console.log(`FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
-        // FFmpeg komutunu çalıştırın
         const { stdout, stderr } = await execPromise(ffmpegCommand);
-
         console.log('FFmpeg stdout:', stdout);
-        if (stderr) {
-             // FFmpeg genellikle bilgiyi stderr'a yazar, her zaman hata değildir
-            console.warn('FFmpeg stderr:', stderr);
-        }
+        if (stderr) { console.warn('FFmpeg stderr:', stderr); }
         console.log('FFmpeg komutu tamamlandı.');
 
-        // Birleştirilmiş dosyayı oku
         const outputBinary = await fs.readFile(outputFilePath);
         console.log(`Birleştirilmiş çıktı dosyası okundu: ${outputFilePath}`);
 
-
-        // Yanıt başlıklarını ayarla
-        res.setHeader('Content-Type', 'audio/mpeg'); // Veya 'audio/mp3'
-        res.setHeader('Content-Disposition', `attachment; filename="${outputFileName}"`); // Dosya adını belirle
+        // Yanıt başlıklarını ayarla ve dosyayı gönder
+        res.setHeader('Content-Type', 'audio/mpeg');
+        res.setHeader('Content-Disposition', `attachment; filename="${outputFileName}"`);
         res.setHeader('Content-Length', outputBinary.length);
-
-        // Birleştirilmiş dosyayı yanıt olarak gönder
         res.status(200).send(outputBinary);
         console.log('Birleştirilmiş dosya gönderildi.');
 
     } catch (error) {
         console.error("İşlem sırasında hata oluştu:", error);
-        res.status(500).send(`Dosyalar işlenirken hata oluştu: ${error.message}`);
+        // Hata durumunda detaylı bilgi göndermek yerine jenerik bir mesaj daha iyi olabilir
+        res.status(500).send("Dosyalar işlenirken bir hata oluştu.");
     } finally {
-        // Tüm geçici dosyaları temizle
         console.log("Geçici dosyalar temizleniyor...");
+        // Tüm geçici dosyaları temizle
         for (const file of filesToClean) {
             try {
                 await fs.unlink(file);
                 console.log(`Temizlendi: ${file}`);
             } catch (e) {
-                // Temizleme hatalarını yoksay
-                console.warn(`Temizlenemedi (muhtemelen yok): ${file}. Hata: ${e.message}`);
+                 console.warn(`Temizlenemedi (muhtemelen yok): ${file}. Hata: ${e.message}`);
             }
         }
     }
 });
-
 // Sunucuyu başlat
 app.listen(port, () => {
     console.log(`Ses birleştirme servisi ${port} portunda çalışıyor`);
