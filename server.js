@@ -67,15 +67,12 @@ app.post('/merge', upload, async (req, res) => {
         }
     }
 
-    // Array to hold paths of all temporary files that need cleaning up (uploaded files, list file, output file).
+    // Array to hold paths of all temporary files that need cleaning up.
     // Start with all the uploaded temporary files.
-    let listFilePath = null; // Variable to hold the path of the concat list file (only created during merge)
-    let outputFilePath = null; // Variable to hold the path of the merged output file (only created during merge)
-    let normalizedOutputFilePath = null; // Variable to hold the path of the normalized output file
+    let normalizedOutputFilePath = null; // Variable to hold the path of the final normalized output file
     const filesToClean = [...allTempFilePaths]; // Clone the array of uploaded file paths
 
-    // *** IMPORTANT: Declare tmpDir within the scope of this async function ***
-    // This line fixes the ReferenceError. It gets the system's temporary directory path.
+    // Get the system's temporary directory path.
     const tmpDir = os.tmpdir();
 
     try {
@@ -91,23 +88,29 @@ app.post('/merge', upload, async (req, res) => {
             console.log(`Sadece 1 dosya yüklendi, normalize ediliyor: ${validPaths[0]}`);
             const singleFilePath = validPaths[0];
             const timestamp = Date.now();
+            // Define the path for the normalized output file in the temporary directory
             normalizedOutputFilePath = path.join(tmpDir, `normalized_audio_${timestamp}.mp3`);
-            filesToClean.push(normalizedOutputFilePath);
+            filesToClean.push(normalizedOutputFilePath); // Add output file to cleanup list
 
-            // Normalize the single file
-            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            // Normalize the single file using loudnorm filter
+            // Use posix paths for FFmpeg command regardless of OS
+            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm -c:a libmp3lame "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
             console.log(`FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
-            await execPromise(normalizeCommand);
+            const { stdout, stderr } = await execPromise(normalizeCommand);
+            console.log('FFmpeg normalize stdout:', stdout);
+            if (stderr) { console.warn('FFmpeg normalize stderr:', stderr); }
+            console.log('FFmpeg normalize komutu tamamlandı.');
 
             // Read the binary content of the normalized file
             const singleFileBinary = await fs.readFile(normalizedOutputFilePath);
 
             // Get the original details (name, mime type) using the temporary path
+            // Fallback to default if original details are not found (shouldn't happen for validPaths[0])
             const originalDetails = uploadedFileDetails[singleFilePath] || { originalname: 'single_audio.mp3', mimetype: 'audio/mpeg' };
 
             // Set HTTP response headers for file download
-            res.setHeader('Content-Type', originalDetails.mimetype); // Set the MIME type
-            res.setHeader('Content-Disposition', `attachment; filename="${originalDetails.originalname}"`); // Suggest a filename for download
+            res.setHeader('Content-Type', 'audio/mpeg'); // Set to MP3 as we re-encode to MP3
+            res.setHeader('Content-Disposition', `attachment; filename="normalized_${originalDetails.originalname}"`); // Suggest a filename for download
             res.setHeader('Content-Length', singleFileBinary.length); // Set the content length
 
             // Send the binary content of the normalized file with a 200 OK status
@@ -115,50 +118,51 @@ app.post('/merge', upload, async (req, res) => {
             console.log('Normalize edilmiş tek dosya gönderildi.');
 
         } else {
-            // Case 3: 2 or more files were uploaded. Proceed with merging using FFmpeg.
-            console.log(`${validPaths.length} dosya yüklendi, birleştirme yapılıyor.`);
+            // Case 3: 2 or more files were uploaded. Proceed with merging using FFmpeg concat filter.
+            console.log(`${validPaths.length} dosya yüklendi, birleştirme ve normalizasyon yapılıyor.`);
             const timestamp = Date.now(); // Use a timestamp for unique filenames
 
-            // Define paths for the FFmpeg concat list file, merged output file, and normalized output file in the temporary directory
-            listFilePath = path.join(tmpDir, `n8n_service_concat_list_${timestamp}.txt`);
-            outputFilePath = path.join(tmpDir, `merged_audio_${timestamp}.mp3`);
+            // Define the path for the final normalized and merged output file in the temporary directory
             normalizedOutputFilePath = path.join(tmpDir, `normalized_merged_audio_${timestamp}.mp3`);
+            filesToClean.push(normalizedOutputFilePath); // Add output file to cleanup list
 
-            // Add the list, output, and normalized file paths to the cleanup list
-            filesToClean.push(listFilePath, outputFilePath, normalizedOutputFilePath);
+            // --- Construct the FFmpeg command using concat filter ---
+            // Build the input arguments (-i "path") for each file
+            const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
 
-            // Create the content for the FFmpeg concat demuxer list file.
-            const listContent = validPaths.map(filePath => `file '${filePath.replace(/\\/g, '/')}'`).join('\n');
-            await fs.writeFile(listFilePath, listContent);
-            console.log(`Concat list dosyası oluşturuldu: ${listFilePath}`);
+            // Build the input mapping for the filter_complex (e.g., "[0:a][1:a][2:a]")
+            const inputMapping = validPaths.map((_, index) => `[${index}:a]`).join('');
 
-            // Construct the FFmpeg command to concatenate the files
-            const ffmpegCommand = `ffmpeg -y -f concat -safe 0 -i "${listFilePath.replace(/\\/g, '/')}" -c copy "${outputFilePath.replace(/\\/g, '/')}"`;
-            console.log(`FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
+            // Build the filter_complex string: concat inputs, then apply loudnorm
+            // n = number of inputs (validPaths.length)
+            // v=0 (no video output), a=1 (one audio output)
+            const filterComplex = `${inputMapping}concat=n=${validPaths.length}:v=0:a=1[a];[a]loudnorm=I=-14:TP=-1.0:LRA=11[out]`;
+
+            // Combine everything into the final FFmpeg command
+            // -y: Overwrite output file without asking
+            // -map "[out]": Map the output stream labeled "[out]" (result of loudnorm) to the output file
+            // -c:a libmp3lame: Re-encode audio to MP3 using libmp3lame (reliable output format)
+            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+
+            console.log(`FFmpeg birleştirme ve normalizasyon komutu çalıştırılıyor: ${ffmpegCommand}`);
 
             // Execute the FFmpeg command
             const { stdout, stderr } = await execPromise(ffmpegCommand);
             console.log('FFmpeg stdout:', stdout);
             if (stderr) { console.warn('FFmpeg stderr:', stderr); }
-            console.log('FFmpeg komutu tamamlandı.');
+            console.log('FFmpeg birleştirme ve normalizasyon komutu tamamlandı.');
 
-            // Now normalize the merged output
-            const normalizeCommand = `ffmpeg -y -i "${outputFilePath.replace(/\\/g, '/')}" -filter:a "loudnorm=I=-14:TP=-1.0:LRA=11" "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
-            console.log(`FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
-            await execPromise(normalizeCommand);
-            console.log('Normalize işlemi tamamlandı.');
-
-            // Read the binary content of the normalized merged output file
+            // Read the binary content of the final output file
             const outputBinary = await fs.readFile(normalizedOutputFilePath);
-            console.log(`Normalize edilmiş çıktı dosyası okundu: ${normalizedOutputFilePath}`);
+            console.log(`Birleştirilmiş ve normalize edilmiş çıktı dosyası okundu: ${normalizedOutputFilePath}`);
 
-            // Define the filename for the normalized merged output file when sent as a download.
+            // Define the filename for the final output file when sent as a download.
             const mergedFileName = `merged_audio_${timestamp}.mp3`;
-            res.setHeader('Content-Type', 'audio/mpeg'); // Assuming the output is always MP3
+            res.setHeader('Content-Type', 'audio/mpeg'); // Output is MP3
             res.setHeader('Content-Disposition', `attachment; filename="${mergedFileName}"`);
             res.setHeader('Content-Length', outputBinary.length);
 
-            // Send the binary content of the normalized merged file with a 200 OK status
+            // Send the binary content of the final file with a 200 OK status
             res.status(200).send(outputBinary);
             console.log('Birleştirilmiş ve normalize edilmiş dosya gönderildi.');
         }
@@ -166,21 +170,26 @@ app.post('/merge', upload, async (req, res) => {
     } catch (error) {
         // Catch any errors that occurred during the try block (file ops, FFmpeg execution etc.)
         console.error("İşlem sırasında hata oluştu:", error);
-        res.status(500).send("Dosyalar işlenirken bir hata oluştu.");
+        // Send a 500 Internal Server Error response with the error message
+        // In a production environment, you might want to send a more generic message and log the specific error server-side
+        res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}`);
     } finally {
         // This block runs regardless of whether the try block succeeded or the catch block was executed.
         // It's used here to ensure temporary files are cleaned up.
         console.log("Geçici dosyalar temizleniyor...");
         for (const file of filesToClean) {
             try {
+                // Check if the file path is valid (not null or undefined)
                 if (file) {
-                    await fs.unlink(file);
+                    await fs.unlink(file); // Attempt to delete the file
                     console.log(`Temizlendi: ${file}`);
                 }
             } catch (e) {
+                // Log a warning if cleanup fails for a file (e.g., file might not exist due to a previous error)
                 console.warn(`Temizlenemedi (muhtemelen yok): ${file}. Hata: ${e.message}`);
             }
         }
+        console.log("Geçici dosyalar temizleme tamamlandı.");
     }
 });
 
