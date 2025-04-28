@@ -46,7 +46,7 @@ app.post('/merge', upload, async (req, res) => {
     // Array to collect the temporary file paths of ALL uploaded files for cleanup.
     const allTempFilePaths = [];
 
-    // Loop through the expected field names (file1 to file6)
+    // Loop through the expected field names (file1 to file6) to preserve order
     for (let i = 1; i <= 6; i++) {
         const fieldName = `file${i}`;
         // Access the file array for the current field using optional chaining (?.) in case the field wasn't sent.
@@ -61,7 +61,7 @@ app.post('/merge', upload, async (req, res) => {
                 originalname: file.originalname,
                 mimetype: file.mimetype
             };
-            console.log(`Alan '${fieldName}' için dosya yüklendi: ${file.path}, Original: ${file.originalname}`);
+            console.log(`Alan '${fieldName}' için dosya yüklendi (Sıra: ${validPaths.length}): ${file.path}, Original: ${file.originalname}`);
         } else {
             console.log(`Alan '${fieldName}' için dosya yüklenmedi.`);
         }
@@ -92,9 +92,9 @@ app.post('/merge', upload, async (req, res) => {
             normalizedOutputFilePath = path.join(tmpDir, `normalized_audio_${timestamp}.mp3`);
             filesToClean.push(normalizedOutputFilePath); // Add output file to cleanup list
 
-            // Normalize the single file using loudnorm filter
+            // Normalize the single file using loudnorm filter, output as MP3
             // Use posix paths for FFmpeg command regardless of OS
-            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm -c:a libmp3lame "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`; // Added bitrate for MP3
             console.log(`FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
             const { stdout, stderr } = await execPromise(normalizeCommand);
             console.log('FFmpeg normalize stdout:', stdout);
@@ -105,8 +105,7 @@ app.post('/merge', upload, async (req, res) => {
             const singleFileBinary = await fs.readFile(normalizedOutputFilePath);
 
             // Get the original details (name, mime type) using the temporary path
-            // Fallback to default if original details are not found (shouldn't happen for validPaths[0])
-            const originalDetails = uploadedFileDetails[singleFilePath] || { originalname: 'single_audio.mp3', mimetype: 'audio/mpeg' };
+            const originalDetails = uploadedFileDetails[singleFilePath] || { originalname: 'single_audio.mp3' };
 
             // Set HTTP response headers for file download
             res.setHeader('Content-Type', 'audio/mpeg'); // Set to MP3 as we re-encode to MP3
@@ -118,33 +117,51 @@ app.post('/merge', upload, async (req, res) => {
             console.log('Normalize edilmiş tek dosya gönderildi.');
 
         } else {
-            // Case 3: 2 or more files were uploaded. Proceed with merging using FFmpeg concat filter.
-            console.log(`${validPaths.length} dosya yüklendi, birleştirme ve normalizasyon yapılıyor.`);
+            // Case 3: 2 or more files were uploaded. Proceed with merging using FFmpeg concat filter + silence + normalization.
+            console.log(`${validPaths.length} dosya yüklendi, ilk dosya sonrası 1sn sessizlik eklenip birleştirme ve normalizasyon yapılıyor.`);
             const timestamp = Date.now(); // Use a timestamp for unique filenames
 
             // Define the path for the final normalized and merged output file in the temporary directory
             normalizedOutputFilePath = path.join(tmpDir, `normalized_merged_audio_${timestamp}.mp3`);
             filesToClean.push(normalizedOutputFilePath); // Add output file to cleanup list
 
-            // --- Construct the FFmpeg command using concat filter ---
+            // --- Construct the FFmpeg command using concat filter with silence ---
             // Build the input arguments (-i "path") for each file
             const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
 
-            // Build the input mapping for the filter_complex (e.g., "[0:a][1:a][2:a]")
-            const inputMapping = validPaths.map((_, index) => `[${index}:a]`).join('');
+            // 1 second silence source: aevalsrc=0:s=SampleRate:d=Duration
+            // Using a common sample rate like 44100 or 48000. Loudnorm should handle resampling.
+            // Let's use 44100 as a common default.
+            const silenceFilterSource = `aevalsrc=0:s=44100:d=1[silence_out];`; // Generates 1s silence, labels output as [silence_out]
 
-            // Build the filter_complex string: concat inputs, then apply loudnorm
-            // n = number of inputs (validPaths.length)
-            // v=0 (no video output), a=1 (one audio output)
-            const filterComplex = `${inputMapping}concat=n=${validPaths.length}:v=0:a=1[a];[a]loudnorm=I=-14:TP=-1.0:LRA=11[out]`;
+            // Build the input mapping for the concat filter, including silence after the first audio input [0:a]
+            // Inputs to concat will be [0:a], [silence_out], [1:a], [2:a], ...
+            const concatInputPads = [
+                '[0:a]', // First audio input
+                '[silence_out]', // Silence output from aevalsrc
+                ...validPaths.slice(1).map((_, index) => `[${index + 1}:a]`) // Remaining audio inputs ([1:a], [2:a], ...)
+            ].join('');
+
+            // Total number of inputs to the concat filter = number of audio files + 1 (for silence)
+            const totalConcatInputs = validPaths.length + 1;
+
+            // Build the concat filter: take N+1 inputs, output 0 video, 1 audio, label audio as [a]
+            const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`;
+
+            // Build the loudnorm filter: take [a] input, apply loudnorm, label output as [out]
+             const loudnormFilter = '[a]loudnorm=I=-14:TP=-1.0:LRA=11[out]'; // Standard loudnorm parameters
+
+            // Combine all filters into the filter_complex string
+            const filterComplex = `${silenceFilterSource}${concatFilter}${loudnormFilter}`;
 
             // Combine everything into the final FFmpeg command
             // -y: Overwrite output file without asking
             // -map "[out]": Map the output stream labeled "[out]" (result of loudnorm) to the output file
             // -c:a libmp3lame: Re-encode audio to MP3 using libmp3lame (reliable output format)
-            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            // -b:a 192k: Set audio bitrate to 192kbps (a common setting for MP3 audio)
+            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
 
-            console.log(`FFmpeg birleştirme ve normalizasyon komutu çalıştırılıyor: ${ffmpegCommand}`);
+            console.log(`FFmpeg birleştirme (1sn sessizlik) ve normalizasyon komutu çalıştırılıyor: ${ffmpegCommand}`);
 
             // Execute the FFmpeg command
             const { stdout, stderr } = await execPromise(ffmpegCommand);
