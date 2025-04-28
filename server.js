@@ -143,7 +143,7 @@ app.post('/merge', upload, async (req, res) => {
             console.log('FFmpeg komutu tamamlandı.');
 
             // Now normalize the merged output
-            const normalizeCommand = `ffmpeg -y -i "${outputFilePath.replace(/\\/g, '/')}" -filter:a loudnorm "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            const normalizeCommand = `ffmpeg -y -i "${outputFilePath.replace(/\\/g, '/')}" -filter:a "loudnorm=I=-14:TP=-1.0:LRA=11" "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
             console.log(`FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
             await execPromise(normalizeCommand);
             console.log('Normalize işlemi tamamlandı.');
