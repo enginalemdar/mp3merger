@@ -6,7 +6,9 @@ const path = require('path'); // Dosya ve dizin yolları ile çalışmak için y
 const os = require('os'); // İşletim sistemiyle ilgili yardımcı program (tmpdir gibi)
 const { exec } = require('child_process'); // Harici komutları çalıştırmak için (ffmpeg gibi)
 const util = require('util'); // Node.js dahili API'leri için yardımcı program
-const PQueue = require('p-queue'); // İstekleri sıraya almak için kütüphane - YENİ EKLENDİ
+// p-queue kütüphanesini içe aktarın. CommonJS require kullanılırken .default eklenmelidir.
+const PQueue = require('p-queue').default; // İstekleri sıraya almak için kütüphane - HATA DÜZELTMESİ BURADA (.default eklendi)
+
 
 // child_process.exec'i async/await ile kullanmak için Promise'e dönüştürün
 const execPromise = util.promisify(exec);
@@ -19,7 +21,7 @@ const port = process.env.PORT || 3000;
 // Multer'ı dosya yüklemeleri için yapılandırın
 // dest: Yüklenen dosyaların geçici olarak depolanacağı dizini belirtir. os.tmpdir() sistemin varsayılan geçici dizinini alır.
 // .fields([...]): Multer'ı belirli, bitişik olmayan alanları kabul edecek şekilde yapılandırır.
-// Dizideki her nesne, beklenen alan adını ve o alan için maksimum dosya sayısını tanımlar.
+// Her nesne, beklenen alan adını ve o alan için maksimum dosya sayısını tanımlar.
 const upload = multer({ dest: os.tmpdir() }).fields([
     { name: 'file1', maxCount: 1 },
     { name: 'file2', maxCount: 1 },
@@ -40,19 +42,19 @@ console.log(`Ses işleme kuyruğu oluşturuldu, maksimum ${processingQueue.concu
 
 // *** Ses işleme mantığının tamamını içeren asenkron fonksiyon ***
 // Bu fonksiyon, bir kuyruk görevi olarak çalışacak ve kendisine verilen Express yanıt nesnesini (res) kullanarak yanıtı gönderecek.
+// req ve res nesneleri doğrudan bu fonksiyona aktarılır.
 async function processAudioTask(req, res) {
-    // Her istek için benzersiz bir ID veya zaman damgası oluşturun, logları takip etmek için faydalı olur.
+    // Her istek için benzersiz bir zaman damgası oluşturun, logları takip etmek için faydalı olur.
     const timestamp = Date.now();
     console.log(`[${timestamp}] İşlem kuyruktan alındı, başlıyor.`);
 
-    // İstekten gelen parametreleri al
-    // req.body Multer tarafından zaten doldurulmuştur
+    // İstekten gelen parametreleri al (Multer'dan sonra req.body dolu gelir)
     const outputFilenameFromRequest = req.body.outputFilename;
     // silenceDuration ve targetLufs parametrelerini al, geçerli sayı değilse varsayılanı kullan
     const silenceDuration = parseFloat(req.body.silenceDuration) || 1;
     const targetLufs = parseFloat(req.body.targetLufs) || -16;
 
-    console.log(`[${timestamp}] İstek Parametreleri: Çıktı Adı: ${outputFilenameFromRequest}, Sessizlik: ${silenceDuration}sn, Hedef LUFS: ${targetLufs}`);
+    console.log(`[${timestamp}] İstek Parametreleri: Çıktı Adı: ${outputFilenameFromRequest || '(Belirtilmedi)'}, Sessizlik: ${silenceDuration}sn, Hedef LUFS: ${targetLufs}`);
 
 
     const uploadedFields = req.files; // Multer'ın işlediği dosya alanları
@@ -69,8 +71,8 @@ async function processAudioTask(req, res) {
         if (fileArray && fileArray.length > 0) {
             const file = fileArray[0]; // maxCount 1 olduğu için dizi 1 elemanlı olacaktır
             validPaths.push(file.path); // İşlenecek dosya listesine geçici yolu ekle
-            allTempFilePaths.push(file.path); // Temizlik için listeye ekle
-            uploadedFileDetails[file.path] = { // Orijinal bilgileri sakla
+            allTempFilePaths.push(file.path); // Temizlik için listeye ekle (finally bloğunda silinecek)
+            uploadedFileDetails[file.path] = { // Orijinal bilgileri sakla (metadata veya indirme adı için)
                 originalname: file.originalname,
                 mimetype: file.mimetype
             };
@@ -95,7 +97,7 @@ async function processAudioTask(req, res) {
             if (!res.headersSent) {
                 return res.status(400).send(errorMsg);
             } else {
-                console.warn(`[${timestamp}] Hata oluştu ancak yanıt zaten gönderilmişti.`);
+                console.warn(`[${timestamp}] Hata oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
                 return; // Yanıt gönderildiği için fonksiyondan çık
             }
 
@@ -121,11 +123,11 @@ async function processAudioTask(req, res) {
             const singleFileBinary = await fs.readFile(normalizedOutputFilePath);
             const originalDetails = uploadedFileDetails[singleFilePath] || { originalname: 'single_audio.mp3' };
 
-            // İndirme için çıktı dosya adını belirle
+            // İndirme için çıktı dosya adını belirle: İstekten gelen adı kullan veya varsayılanı oluştur
             let finalFilename;
-            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string') {
+            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string' && outputFilenameFromRequest.trim().length > 0) {
                  // İstekten gelen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
-                finalFilename = outputFilenameFromRequest.replace(/[^a-zA-Z0-9_\-.]/g, '') || 'normalized_audio'; // İzin verilmeyen karakterleri kaldır
+                finalFilename = outputFilenameFromRequest.trim().replace(/[^a-zA-Z0-9_\-.]/g, '') || 'normalized_audio'; // İzin verilmeyen karakterleri kaldır, boş kalırsa varsayılan
                 if (!finalFilename.toLowerCase().endsWith('.mp3')) {
                     finalFilename += '.mp3';
                 }
@@ -172,10 +174,6 @@ async function processAudioTask(req, res) {
             // Concat filtresine toplam giriş sayısı = Toplam ses akışı sayısı + Eklenen sessizlik akışı sayısı
             // Sessizlik akışı sayısı: validPaths.length >= 2 ise (Intro ve en az bir TTS varsa) Intro ile ilk TTS arasına sessizlik koymuyoruz.
             // Geriye kalan validPaths.length - 1 adet segmentin (İlk TTS, ikinci TTS...) arasına (validPaths.length - 2) adet sessizlik bloğu eklenir.
-            // validPaths.length == 2 ise (Intro + TTS1), 2-2 = 0 sessizlik. Toplam giriş 2 (audio).
-            // validPaths.length == 3 ise (Intro + TTS1 + TTS2), 3-2 = 1 sessizlik. Toplam giriş 3 (audio) + 1 (silence) = 4.
-            // validPaths.length == N ise, N-2 adet sessizlik. Toplam giriş N (audio) + (N-2) (silence) = 2N - 2 ? Hayır, akışları sayıyoruz:
-            // [0:a] [1:a] [silence_out] [2:a] [silence_out] ... [silence_out] [N-1:a]
             // N adet audio akışı + (N-2) adet silence akışı (N>=2 için). Toplam N + Math.max(0, N-2).
             const numberOfSilenceInputs = Math.max(0, validPaths.length - 2); // Intro ile ilk TTS arasına sessizlik koymadığımız için
             const totalConcatInputs = validPaths.length + numberOfSilenceInputs;
@@ -212,9 +210,9 @@ async function processAudioTask(req, res) {
 
             // İndirme için çıktı dosya adını belirle: İstekten gelen adı kullan veya varsayılanı oluştur
             let finalFilename;
-            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string') {
-                 // İstenen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
-                finalFilename = outputFilenameFromRequest.replace(/[^a-zA-Z0-9_\-.]/g, '') || 'merged_audio'; // İzin verilmeyen karakterleri kaldır
+            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string' && outputFilenameFromRequest.trim().length > 0) {
+                 // İstekten gelen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
+                finalFilename = outputFilenameFromRequest.trim().replace(/[^a-zA-Z0-9_\-.]/g, '') || 'merged_audio'; // İzin verilmeyen karakterleri kaldır, boş kalırsa varsayılan
                  if (!finalFilename.toLowerCase().endsWith('.mp3')) {
                     finalFilename += '.mp3';
                 }
@@ -234,17 +232,17 @@ async function processAudioTask(req, res) {
 
     } catch (error) {
         // *** Hata Yakalama ve Yanıt Gönderme ***
-        // İşlem sırasında bir hata oluşursa burası çalışır.
+        // İşlem sırasında bir hata oluşursa burası çalışır (FFmpeg hatası, dosya okuma hatası vb.).
         console.error(`[${timestamp}] İşlem sırasında hata oluştu:`, error);
         // Yanıt daha önce gönderilmemişse (örneğin, bir hata yanıtı veya başarılı yanıt zaten gönderilmemişse), hata yanıtı gönder.
-        // Bu kontrol, yanıtın sadece bir kez gönderilmesini sağlar.
+        // Bu kontrol, aynı isteğe birden fazla kez yanıt gönderilmesini önler.
         if (!res.headersSent) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
              res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
              // Debug için hatanın detayını göndermek isterseniz: res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}`);
         } else {
              // Hata oluştu ancak yanıt zaten gönderilmişti (örn: belki dosya okuma hatası yanıtı gönderildi sonra temizlik hatası oldu).
-             console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti.`);
+             console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
         }
 
 
@@ -255,11 +253,9 @@ async function processAudioTask(req, res) {
         // filesToClean listesindeki her dosya için silme işlemi yap
         for (const file of filesToClean) {
             try {
-                // Dosya yolunun geçerli olup olmadığını kontrol edin ve dosyanın mevcut olup olmadığını kontrol edin.
-                // fs.existsSync senkron bir metod olduğu için performans kritik yollarda dikkatli kullanın.
-                // Daha güvenli bir kontrol, silme işleminin kendisinin hata fırlatıp fırlatmadığını kontrol etmektir.
+                // Dosya yolunun geçerli olup olmadığını kontrol edin.
                 if (file) {
-                    // Dosyayı silmeye çalış
+                    // Dosyayı silmeye çalış. Silme işlemi dosya mevcut değilse hata fırlatacaktır.
                     await fs.unlink(file);
                     console.log(`[${timestamp}] Temizlendi: ${file}`);
                 } else {
@@ -267,44 +263,44 @@ async function processAudioTask(req, res) {
                 }
             } catch (e) {
                 // Silme işlemi hata verirse (dosya yoksa, izin yoksa vb.) logla ama devam et.
-                // Dosyanın zaten silinmiş olması yaygın bir durumdur (örn: önceki bir hata dosyanın oluşturulmasını engellemiş olabilir).
+                // Dosyanın zaten silinmiş olması ('ENOENT' hatası) yaygın bir durumdur (örn: önceki bir hata dosyanın oluşturulmasını engellemiş olabilir).
                 if (e.code === 'ENOENT') { // 'ENOENT' hatası dosyanın mevcut olmadığı anlamına gelir
                      console.log(`[${timestamp}] Geçici dosya zaten yoktu veya silinmişti: ${file}`);
                 } else {
-                    console.warn(`[${timestamp}] Geçici dosya temizlenemedi (muhtemelen izin hatası veya başka sebep): ${file}. Hata: ${e.message}`);
+                    console.warn(`[${timestamp}] Geçici dosya temizlenemedi (perm hatası veya başka sebep): ${file}. Hata: ${e.message}`);
                 }
             }
         }
         console.log(`[${timestamp}] Geçici dosyalar temizleme tamamlandı.`);
-        console.log(`[${timestamp}] İşlem tamamlandı.`);
+        console.log(`[${timestamp}] İşlem tamamlandı. İstek ID: ${timestamp}`);
     }
 }
 
 
 // *** Birleştirme POST Uç Noktası ***
-// Bu handler sadece gelen isteği alır, Multer ile dosyaları işler ve asıl işleme görevini kuyruğa ekler.
+// Bu handler sadece gelen isteği kabul eder, Multer ile dosyaları/alanları işler
+// ve asıl CPU/I/O yoğun işleme görevini kuyruğa ekler.
 // Asıl işleme ve yanıt gönderme `processAudioTask` içinde gerçekleşir.
 app.post('/merge', upload, async (req, res) => {
     console.log('Merge isteği alındı, kuyruğa ekleniyor.');
 
-    // İstek işleme görevini kuyruğa ekle.
-    // `processAudioTask` fonksiyonunu bir lambda/arrow fonksiyonu içine sarmak önemlidir: `() => processAudioTask(req, res)`
+    // İstek işleme görevini (processAudioTask fonksiyonunu) bir lambda/arrow fonksiyonu içine sarmalayarak kuyruğa ekleyin.
     // Bu şekilde `processAudioTask` fonksiyonu hemen çalıştırılmaz, sadece kuyruğa eklenir.
-    // Kuyruk uygun olduğunda (concurrency limitine göre) bu fonksiyonu çalıştıracaktır.
-    // `await processingQueue.add(...)` satırı, bu Express handler'ının görevin kuyrukta işlenip **tamamlanmasını** beklemesini sağlar.
-    // Eğer beklemek istemiyorsanız (örneğin "işleminiz kuyruğa eklendi, daha sonra kontrol edin" gibi bir yanıt hemen göndermek isterseniz), `await` kullanmazsınız.
-    // Ancak şu anki senaryoda, işlem bitince doğrudan dosyayı indirtmek istediğimiz için beklemek gerekiyor.
+    // Kuyruk, `concurrency` limitine uygun olduğunda bu sarmalanmış fonksiyonu çalıştıracaktır.
+    // `await processingQueue.add(...)` satırı, bu Express handler'ının, görevin kuyrukta işlenip **tamamlanmasını** beklemesini sağlar.
+    // Bu, aynı anda çalışan görev sayısını kontrol eder ve her isteğin işi bitince yanıt almasını sağlar.
     try {
         // Görevi kuyruğa ekle ve tamamlanmasını bekle
         await processingQueue.add(() => processAudioTask(req, res));
-        // Görev tamamlandığında processAudioTask zaten yanıtı göndermiş olacaktır.
+        // Görev (processAudioTask) tamamlandığında zaten yanıtı (res.send vb.) göndermiş olacaktır.
+        // Bu satıra ulaşıldığında yanıt zaten gönderilmiş demektir.
         console.log('Merge isteği kuyrukta işlendi ve yanıt gönderildi.');
 
     } catch (error) {
-        // Bu catch bloğu çoğunlukla `queue.add` sırasında oluşabilecek çok nadir hataları yakalar.
-        // İşlem (FFmpeg çalıştırma vb.) sırasında oluşan hatalar `processAudioTask` içindeki catch'te yakalanır.
+        // Bu catch bloğu, sadece görevin kuyruğa eklenmesi sırasında veya kuyruğun kendisiyle ilgili çok nadir hataları yakalar.
+        // İşlem (FFmpeg çalıştırma vb.) sırasında oluşan hatalar `processAudioTask` içindeki catch'te yakalanır ve orası yanıtı gönderir.
          console.error('Kuyruk yönetimi sırasında beklenmedik hata:', error);
-         // Eğer yanıt henüz gönderilmemişse (normalde processAudioTask hata verseydi gönderilmiş olurdu), bir hata yanıtı gönder.
+         // Eğer yanıt henüz gönderilmemişse (normalde processAudioTask hata verseydi gönderilmiş olurdu), genel bir hata yanıtı gönder.
          if (!res.headersSent) {
              res.status(500).send('İşlem kuyruğa eklenirken veya yönetilirken bir hata oluştu.');
          }
