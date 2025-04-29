@@ -160,43 +160,56 @@ async function processAudioTask(req, res) {
             // Her dosya için giriş argümanlarını (-i "yol") oluşturun
             const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
 
-            // Sessizlik kaynağı filtresi, istenen süreyi kullanır
-            const silenceFilterSource = `aevalsrc=0:s=44100:d=${silenceDuration}[silence_out];`;
+            // *** FFmpeg filter_complex dizesini validPaths.length'e göre koşullu olarak oluştur ***
+            let filterComplex;
+            let concatInputPads = '';
+            let totalConcatInputs;
 
-            // Concat filtresi girişlerini oluşturun: [0:a][1:a][silence_out][2:a][silence_out]...[N-1:a]
-            // validPaths.length >= 2 olduğunu zaten biliyoruz (aksi takdirde üstteki else if çalışırdı)
-            let concatInputPads = '[0:a][1:a]'; // Intro ([0:a]) ve ilk TTS ([1:a]) her zaman yan yana birleşir
-            // Eğer 2'den fazla dosya varsa (yani en az 3 dosya varsa, index 2'den başlar), kalan TTS'ler arasına sessizlik ekle
-            for (let i = 2; i < validPaths.length; i++) {
-                concatInputPads += `[silence_out][${i}:a]`; // Silence -> Sonraki TTS
+            if (validPaths.length === 2) {
+                 // Sadece 2 dosya (Intro + TTS1): Sessizliğe gerek yok, sadece birleştir ve normalize et.
+                 // aevalsrc filtresine veya [silence_out] pimine gerek yok.
+                 concatInputPads = '[0:a][1:a]'; // İlk iki dosyanın ses akışları
+                 totalConcatInputs = 2; // Concat'a 2 giriş var
+
+                 const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
+                 const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
+                 filterComplex = `${concatFilter}${loudnormFilter}`; // filter_complex sadece concat ve loudnorm içerir
+
+                 console.log(`[${timestamp}] Concat/Normalize (2 dosya, sessizliksiz): ${filterComplex}`);
+
+            } else { // validPaths.length > 2 (Intro + TTS1 + TTS2 + ...): Sessizlik gerekli
+                 // Sessizlik kaynağı filtresi, istenen süreyi kullanır
+                 const silenceFilterSource = `aevalsrc=0:s=44100:d=${silenceDuration}[silence_out];`;
+
+                 // Concat filtresi girişlerini oluşturun: [0:a][1:a] (Intro + TTS1)
+                 // ardından kalan TTS'ler arasına [silence_out][i:a] ekle
+                 concatInputPads = '[0:a][1:a]';
+                 for (let i = 2; i < validPaths.length; i++) {
+                     concatInputPads += `[silence_out][${i}:a]`; // Silence -> Sonraki TTS (index i)
+                 }
+
+                 // Concat filtresine toplam giriş sayısı = Toplam ses akışı sayısı + Eklenen sessizlik akışı sayısı
+                 // Sessizlik akışı sayısı: validPaths.length >= 2 ise (Intro + en az bir TTS varsa)
+                 // Intro ile ilk TTS arasına sessizlik koymuyoruz. Geriye kalan (validPaths.length - 1) segmentin arasına (validPaths.length - 2) adet sessizlik bloğu eklenir.
+                 const numberOfSilenceInputs = validPaths.length - 2; // Sessizlik [1:a] ile [2:a], [2:a] ile [3:a], ..., [N-2:a] ile [N-1:a] arasına konur.
+                 totalConcatInputs = validPaths.length + numberOfSilenceInputs; // Toplam giriş sayısı = Ses akışları + Sessizlik akışları
+
+                 const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
+                 const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
+                 filterComplex = `${silenceFilterSource}${concatFilter}${loudnormFilter}`; // filter_complex sessizlik kaynağını da içerir
+
+                 console.log(`[${timestamp}] Concat/Normalize (>2 dosya, sessizlik dahil): ${filterComplex}`);
             }
 
-            // Concat filtresine toplam giriş sayısı = Toplam ses akışı sayısı + Eklenen sessizlik akışı sayısı
-            // Sessizlik akışı sayısı: validPaths.length >= 2 ise (Intro ve en az bir TTS varsa) Intro ile ilk TTS arasına sessizlik koymuyoruz.
-            // Geriye kalan validPaths.length - 1 adet segmentin (İlk TTS, ikinci TTS...) arasına (validPaths.length - 2) adet sessizlik bloğu eklenir.
-            // N adet audio akışı + (N-2) adet silence akışı (N>=2 için). Toplam N + Math.max(0, N-2).
-            const numberOfSilenceInputs = Math.max(0, validPaths.length - 2); // Intro ile ilk TTS arasına sessizlik koymadığımız için
-            const totalConcatInputs = validPaths.length + numberOfSilenceInputs;
-
-
-            // Concat filtresini oluşturun (n= toplam giriş sayısı)
-            const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`;
-
-            // Loudnorm filtresini oluşturun, hedef LUFS parametresini kullanır
-            const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Hedef LUFS kullanılıyor
-
-            // Tüm filtreleri birleştirin (filter_complex dizesi)
-            const filterComplex = `${silenceFilterSource}${concatFilter}${loudnormFilter}`;
-
-            // Nihai FFmpeg komutunu oluşturun
+            // --- FFmpeg komutunu oluşturmaya devam et ---
             // -y: çıktı dosyasının üzerine sormadan yaz
-            // -filter_complex: birden çok filtreyi zincirle
+            // -filter_complex: yukarıda oluşturulan dizeyi kullan
             // -map "[out]": filter_complex çıktısını (`[out]` olarak etiketlenen) çıktı dosyasına eşle
             // -c:a libmp3lame: ses kodeği (MP3)
             // -b:a 192k: ses bit hızı
             const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
 
-            console.log(`[${timestamp}] FFmpeg birleştirme ve normalizasyon komutu çalıştırılıyor: ${ffmpegCommand}`);
+            console.log(`[${timestamp}] FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
 
             // FFmpeg komutunu çalıştır ve bekle
             const { stdout, stderr } = await execPromise(ffmpegCommand);
@@ -238,8 +251,10 @@ async function processAudioTask(req, res) {
         // Bu kontrol, aynı isteğe birden fazla kez yanıt gönderilmesini önler.
         if (!res.headersSent) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
+             // FFmpeg hatalarının stderr çıktısı logda var, kullanıcıya detay vermeden genel bir hata mesajı daha güvenlidir.
              res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
-             // Debug için hatanın detayını göndermek isterseniz: res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}`);
+             // Debug için hatanın detayını göndermek isterseniz (dikkatli kullanın!):
+             // res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
         } else {
              // Hata oluştu ancak yanıt zaten gönderilmişti (örn: belki dosya okuma hatası yanıtı gönderildi sonra temizlik hatası oldu).
              console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
@@ -255,7 +270,8 @@ async function processAudioTask(req, res) {
             try {
                 // Dosya yolunun geçerli olup olmadığını kontrol edin.
                 if (file) {
-                    // Dosyayı silmeye çalış. Silme işlemi dosya mevcut değilse hata fırlatacaktır.
+                    // Dosyayı silmeye çalış. await kullanıyoruz.
+                    // Silme işlemi dosya mevcut değilse veya izin yoksa hata fırlatacaktır.
                     await fs.unlink(file);
                     console.log(`[${timestamp}] Temizlendi: ${file}`);
                 } else {
@@ -288,7 +304,8 @@ app.post('/merge', upload, async (req, res) => {
     // Bu şekilde `processAudioTask` fonksiyonu hemen çalıştırılmaz, sadece kuyruğa eklenir.
     // Kuyruk, `concurrency` limitine uygun olduğunda bu sarmalanmış fonksiyonu çalıştıracaktır.
     // `await processingQueue.add(...)` satırı, bu Express handler'ının, görevin kuyrukta işlenip **tamamlanmasını** beklemesini sağlar.
-    // Bu, aynı anda çalışan görev sayısını kontrol eder ve her isteğin işi bitince yanıt almasını sağlar.
+    // Eğer beklemek istemiyorsanız (örneğin "işleminiz kuyruğa eklendi, daha sonra kontrol edin" gibi bir yanıt hemen göndermek isterseniz), `await` kullanmazsınız ve buradan hemen bir yanıt dönersiniz.
+    // Ancak şu anki senaryoda, işlem bitince doğrudan dosyayı indirtmek istediğimiz için handler'ın beklemesi gerekiyor.
     try {
         // Görevi kuyruğa ekle ve tamamlanmasını bekle
         await processingQueue.add(() => processAudioTask(req, res));
