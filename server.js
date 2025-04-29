@@ -38,7 +38,7 @@ console.log(`Sistemde ${numCPUs} CPU çekirdeği algılandı.`);
 
 // Maksimum kaç ses işleminin (FFmpeg çalıştırma) aynı anda çalışacağını belirleyin.
 // Bunu algılanan CPU çekirdek sayısına ayarlamak genellikle iyi bir başlangıç noktasıdır.
-const processingQueue = new PQueue({ concurrency: 1 }); // Test için concurrency 1 yapıldı
+const processingQueue = new PQueue({ concurrency: numCPUs }); // Eşzamanlılık limiti CPU sayısına ayarlandı
 console.log(`Ses işleme kuyruğu oluşturuldu, maksimum ${processingQueue.concurrency} işlem aynı anda çalışacak.`);
 
 
@@ -78,9 +78,9 @@ async function processAudioTask(req, res) {
                 originalname: file.originalname,
                 mimetype: file.mimetype
             };
-             console.log(`[${timestamp}] Alan '${fieldName}' için dosya yüklendi (Sıra: ${validPaths.length}): ${file.path}, Original: ${file.originalname}`);
+             console.log(`[<span class="math-inline">\{timestamp\}\] Alan '</span>{fieldName}' için dosya yüklendi (Sıra: ${validPaths.length}): ${file.path}, Original: ${file.originalname}`);
         } else {
-             console.log(`[${timestamp}] Alan '${fieldName}' için dosya yüklenmedi.`);
+             console.log(`[<span class="math-inline">\{timestamp\}\] Alan '</span>{fieldName}' için dosya yüklenmedi.`);
         }
     }
 
@@ -120,7 +120,7 @@ async function processAudioTask(req, res) {
             // -b:a: ses bit hızı
             // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir) - çıktıdan önce olmalı
             // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan - çıktıdan önce olmalı
-            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k -preset ultrafast -threads ${numCPUs} "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            const normalizeCommand = `ffmpeg -y -i "<span class="math-inline">\{singleFilePath\.replace\(/\\\\/g, '/'\)\}" \-filter\:a loudnorm\=I\=</span>{targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k -preset ultrafast -threads <span class="math-inline">\{numCPUs\} "</span>{normalizedOutputFilePath.replace(/\\/g, '/')}"`;
             console.log(`[${timestamp}] FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
             const { stdout, stderr } = await execPromise(normalizeCommand); // FFmpeg komutunu çalıştır ve bekle
             console.log(`[${timestamp}] FFmpeg normalize stdout:`, stdout);
@@ -156,16 +156,12 @@ async function processAudioTask(req, res) {
             res.status(200).send(singleFileBinary); // Dosya içeriğini gönder
             console.log(`[${timestamp}] Normalize edilmiş tek dosya gönderildi. Ad: ${finalFilename}`);
 
-        } else {
-            // Durum 2: 2 veya daha fazla dosya yüklendi (Intro + TTS'ler). Birleştirme ve normalizasyon yap.
+        } else { // validPaths.length > 1 (Intro + TTSler), birleştirme ve normalizasyon yap
             console.log(`[${timestamp}] ${validPaths.length} dosya yüklendi, birleştirme ve normalizasyon yapılıyor.`);
 
-            // Birleştirilmiş/normalize edilmiş çıktı dosyasının yolunu belirle
             normalizedOutputFilePath = path.join(tmpDir, `normalized_merged_audio_${timestamp}.mp3`);
-            filesToClean.push(normalizedOutputFilePath); // Oluşacak çıktı dosyasını temizlik listesine ekle
+            filesToClean.push(normalizedOutputFilePath);
 
-            // --- FFmpeg komutunu oluşturun: Intro -> TTS1 -> Silence -> TTS2 -> Silence ... ---
-            // Her dosya için giriş argümanlarını (-i "yol") oluşturun
             const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
 
             // *** FFmpeg filter_complex dizesini oluştur ***
@@ -173,53 +169,53 @@ async function processAudioTask(req, res) {
             let concatInputPads = ''; // Concat filtresine girdi olarak verilecek padlerin listesi
             let totalConcatInputs; // Concatin 'n' parametresi
 
-            // Hedef örnekleme hızını 44100 Hz yapıyoruz. Kanal düzeni için apan'ı kaldırıyoruz, concatın denemesini bekliyoruz.
             const targetSampleRate = 44100;
-            // targetChannelLayout artık kullanılmıyor
 
-            // 1. Tüm girdi ses akışlarını hedef örnekleme hızına dönüştüren filtreleri tanımla
-            // Her girdi [i:a] -> aresample -> [in_i]
-            // *** apan=c=stereo KALDIRILDI *** <-- DİKKAT: Bu satırda apan OLMAMALI!
-            const resampleFilters = validPaths.map((_, i) => `[${i}:a]aresample=${targetSampleRate}[in${i}]`).join(';'); // APAN KALDIRILDI BURADAN
+            // 1. Tüm girdi ses akışlarını hedef örnekleme hızına dönüştüren filtreleri tanımla (virgülle ayır)
+            // Her girdi [i:a] -> aresample -> [in_i]
+            // Başlangıç filtreleri listesi, virgülle ayrılacak
+            const resampleFilterDefinitions = validPaths.map((_, i) => `[<span class="math-inline">\{i\}\:a\]aresample\=</span>{targetSampleRate}[in${i}]`).join(','); // VIRGULLE AYRILIYOR
 
-            // Sessizlik akışını tanımla (hedef örnekleme hızında, varsayılan mono)
-            // aevalsrc -> [silence]
-            // *** apan=c=stereo KALDIRILDI, etiket [silence] olarak değiştirildi *** <-- DİKKAT: Bu satırda da apan OLMAMALI!
-            const silenceFilterSource = `aevalsrc=0:s=${targetSampleRate}:d=${silenceDuration}[silence];`; // APAN KALDIRILDI BURADAN DA
+            // Sessizlik akışını tanımla (virgülle ayır)
+            // aevalsrc -> [silence]
+            const silenceFilterDefinition = `aevalsrc=0:s=<span class="math-inline">\{targetSampleRate\}\:d\=</span>{silenceDuration}[silence]`; // VIRGUL BURADAN SONRA GELECEK
 
 
             if (validPaths.length === 2) {
-                 // Sadece 2 dosya (Intro + TTS1): Sessizliğe gerek yok, sadece resample edilmiş girdileri birleştir ve normalize et.
-                 // Concat'a sadece resample edilmiş girdi padleri ([in0], [in1]) gider.
+                 // Sadece 2 dosya (Intro + TTS1): Sessizliğe gerek yok.
+                 // Initial filters: [0:a]aresample=...[in0], [1:a]aresample=...[in1]
+                 // Then concat: [in0][in1]concat=n=2...[a]
+                 // Then loudnorm: [a]loudnorm=...[out]
                  concatInputPads = '[in0][in1]';
-                 totalConcatInputs = 2; // Concatin 2 girişi var
+                 totalConcatInputs = 2;
 
-                 const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
-                 const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
-                 // filter_complex: Tüm resample filtreleri -> concat -> loudnorm
-                 // Sessizlik kaynağı yok
-                 filterComplex = `${resampleFilters};${concatFilter}${loudnormFilter}`;
+                 // Filter complex string: initial filters, then concat, then loudnorm
+                // Hepsini tek zincirde virgul ile bağlıyoruz
+                 filterComplex = `<span class="math-inline">\{resampleFilterDefinitions\},</span>{concatInputPads}concat=n=<span class="math-inline">\{totalConcatInputs\}\:v\=0\:a\=1\[a\],\[a\]loudnorm\=I\=</span>{targetLufs}:TP=-1.0:LRA=11[out]`;
 
                  console.log(`[${timestamp}] Filter Complex (2 dosya, resampled, sessizliksiz): ${filterComplex}`);
 
             } else { // validPaths.length > 2 (Intro + TTS1 + TTS2 + ...): Sessizlik gerekli
-                 // Concat girişleri: [in0][in1] (resample edilmiş Intro + TTS1)
-                 // ardından kalan resample edilmiş TTSler arasına [silence][in_i] ekle
-                 // *** silence_final -> silence olarak değiştirildi *** <-- DİKKAT: buradaki silence pad adı, silenceFilterSource'taki etiketle AYNİ OLMALI!
+                 // Initial filters: aevalsrc=...[silence], [0:a]aresample=...[in0], [1:a]aresample=...[in1], ...
+                 // Then concat inputs: [in0][in1][silence][in2][silence]...
+                 // Then concat: ...concat=n=N...[a]
+                 // Then loudnorm: [a]loudnorm=...[out]
+
+                 // Başlangıç filtrelerinin listesi (sessizlik + tüm resampleler), virgülle ayırılıyor
+                 const initialFilters = `<span class="math-inline">\{silenceFilterDefinition\},</span>{resampleFilterDefinitions}`; // VIRGULLE AYIR
+
+                 // Concat girişleri: [in0][in1] ardından kalan resample edilmiş TTSler arasına [silence][in_i] ekle
                  concatInputPads = '[in0][in1]';
                  for (let i = 2; i < validPaths.length; i++) {
                      concatInputPads += `[silence][in${i}]`; // Sessizlik akışı ([silence]) -> Sonraki resample edilmiş TTS akışı ([in_i])
                  }
 
-                 // Concat filtresine toplam giriş sayısı = Resample edilmiş audio akış sayısı + Eklenen sessizlik akışı sayısı
-                 // Eklenen sessizlik akışı sayısı = validPaths.length >= 2 ise (validPaths.length - 2)
                  const numberOfSilenceInputs = validPaths.length - 2;
                  totalConcatInputs = validPaths.length + numberOfSilenceInputs; // Toplam giriş sayısı = Resample edilmiş audio akışları + Sessizlik akışları
 
-                 const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
-                 const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
-                 // filter_complex: Sessizlik kaynağı -> Tüm resample filtreleri -> concat -> loudnorm
-                 filterComplex = `${silenceFilterSource}${resampleFilters};${concatFilter}${loudnormFilter}`; // Semicolon bağımsız zincirleri ayırır
+                 // Filter complex string: initial filters, then concat, then loudnorm
+                // Hepsini tek zincirde virgul ile bağlıyoruz
+                 filterComplex = `<span class="math-inline">\{initialFilters\},</span>{concatInputPads}concat=n=<span class="math-inline">\{totalConcatInputs\}\:v\=0\:a\=1\[a\],\[a\]loudnorm\=I\=</span>{targetLufs}:TP=-1.0:LRA=11[out]`;
 
                  console.log(`[${timestamp}] Filter Complex (>2 dosya, resampled, sessizlik dahil): ${filterComplex}`);
             }
@@ -233,7 +229,7 @@ async function processAudioTask(req, res) {
             // -b:a 192k: ses bit hızı
             // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir) - çıktıdan önce olmalı
             // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan - çıktıdan önce olmalı
-            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k -preset ultrafast -threads ${numCPUs} "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            const ffmpegCommand = `ffmpeg -y <span class="math-inline">\{inputArgs\} \-filter\_complex "</span>{filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k -preset ultrafast -threads <span class="math-inline">\{numCPUs\} "</span>{normalizedOutputFilePath.replace(/\\/g, '/')}"`;
 
             console.log(`[${timestamp}] FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
 
@@ -250,8 +246,7 @@ async function processAudioTask(req, res) {
             // İndirme için çıktı dosya adını belirle: İstekten gelen adı kullan veya varsayılanı oluştur
             let finalFilename;
             if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string' && outputFilenameFromRequest.trim().length > 0) {
-                 // İstekten gelen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
-                finalFilename = outputFilenameFromRequest.trim().replace(/[^a-zA-Z0-9_\-.]/g, '') || 'merged_audio'; // İzin verilmeyen karakterleri kaldır, boş kalırsa varsayılan
+                 finalFilename = outputFilenameFromRequest.trim().replace(/[^a-zA-Z0-9_\-.]/g, '') || 'merged_audio';
                  if (!finalFilename.toLowerCase().endsWith('.mp3')) {
                     finalFilename += '.mp3';
                 }
@@ -279,7 +274,6 @@ async function processAudioTask(req, res) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
              // error objesi FFmpeg stderr çıktısını içerebilir (error.stderr)
              res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
-             // Debug için: res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
         } else {
              console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
         }
@@ -338,19 +332,106 @@ app.post('/merge', upload, async (req, res) => {
         console.log('Merge isteği kuyrukta işlendi ve yanıt gönderildi.');
 
     } catch (error) {
-        // Bu catch blokları genellikle kuyrukla ilgili nadir hataları veya görevin eklenmesi sırasında oluşabilecek hataları yakalar.
-        // İşlem (FFmpeg çalıştırma vb.) sırasında oluşan hatalar `processAudioTask` içindeki catchte yakalanır ve orası yanıtı gönderir.
-         console.error('Kuyruk yönetimi sırasında beklenmedik hata:', error);
-         if (!res.headersSent) {
-             res.status(500).send('İşlem kuyruğa eklenirken veya yönetilirken bir hata oluştu.');
-         }
-    }
-});
+        // *** Hata Yakalama ve Yanıt Gönderme ***
+        // İşlem sırasında bir hata oluşursa burası çalışır (FFmpeg hatası, dosya okuma hatası vb.).
+        console.error(`[${timestamp}] İşlem sırasında hata oluştu:`, error);
+        // Yanıt daha önce gönderilmemişse (örneğin, bir hata yanıtı veya başarılı yanıt zaten gönderilmişse), hata yanıtı gönder.
+        // Bu kontrol, aynı isteğe birden fazla kez yanıt gönderilmesini önler.
+        if (!res.headersSent) {
+             // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
+             // error objesi FFmpeg stderr çıktısını içerebilir (error.stderr)
+             res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
+        } else {
+             console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
+        }
 
-// Sunucuyu başlat
-app.listen(port, () => {
-    console.log(`Ses birleştirme servisi ${port} portunda çalışıyor`);
-    const numCPUs = os.cpus().length; // Sunucu başlarken CPU sayısını tekrar logla
-    console.log(`Sistemde ${numCPUs} CPU çekirdeği algılandı.`);
-    console.log(`Ses işleme kuyruğu ${processingQueue.concurrency} concurrency ile çalışıyor.`);
-});
+
+    } finally {
+        // *** Geçici Dosyaları Temizleme ***
+        // try veya catch bloğu tamamlandıktan sonra (işlem başarılı veya başarısız olsa da) burası her zaman çalışır.
+        console.log(`[${timestamp}] Geçici dosyalar temizleniyor...`);
+        // filesToClean listesindeki her dosya için silme işlemi yap
+        for (const file of filesToClean) {
+            try {
+                // Dosya yolunun geçerli olup olmadığını kontrol edin.
+                if (file) {
+                    // Dosyayı silmeye çalış. await kullanıyoruz.
+                    // Silme işlemi dosya mevcut değilse veya izin yoksa hata fırlatacaktır.
+                    await fs.unlink(file);
+                    console.log(`[${timestamp}] Temizlendi: ${file}`);
+                } else {
+                     console.log(`[${timestamp}] Tanımsız geçici dosya yolu atlandı.`);
+                }
+            } catch (e) {
+                // Silme işlemi hata verirse (dosya yoksa, izin yoksa vb.) logla ama devam et.
+                // Dosyanın zaten silinmiş olması ('ENOENT' hatası) yaygın bir durumdur (örn: önceki bir hata dosyanın oluşturulmasını engellemiş olabilir).
+                if (e.code === 'ENOENT') { // 'ENOENT' hatası dosyanın mevcut olmadığı anlamına gelir
+                     console.log(`[${timestamp}] Geçici dosya zaten yoktu veya silinmişti: ${file}`);
+                } else {
+                    console.warn(`[${timestamp}] Geçici dosya temizlenemedi (perm hatası veya başka sebep): ${file}. Hata: ${e.message}`);
+                }
+            }
+        }
+        console.log(`[${timestamp}] Geçici dosyalar temizleme tamamlandı.`);
+        console.log(`[${timestamp}] İşlem tamamlandı. İstek ID: ${timestamp}`);
+    }
+}
+
+
+// *** Birleştirme POST Uç Noktası ***
+// Bu handler sadece gelen isteği kabul eder, Multer ile dosyaları/alanları işler
+// ve asıl CPU/I/O yoğun işleme görevini kuyruğa ekler.
+// Asıl işleme ve yanıt gönderme `processAudioTask` içinde gerçekleşir.
+app.post('/merge', upload, async (req, res) => {
+    console.log('Merge isteği alındı, kuyruğa ekleniyor.');
+
+    // İstek işleme görevini (processAudioTask fonksiyonunu) bir lambda/arrow fonksiyonu içine sarmalayarak kuyruğa ekleyin.
+    // Bu şekilde `processAudioTask` fonksiyonu hemen çalıştırılmaz, sadece kuyruğa eklenir.
+    // Kuyruk, `concurrency` limitine uygun olduğunda bu sarmalanmış fonksiyonu çalıştıracaktır.
+    // `await processingQueue.add(...)` satırı, bu Express handler'ının, görevin kuyrukta işlenip **tamamlanmasını** beklemesini sağlar.
+    // Eğer beklemek istemiyorsanız (örneğin "işleminiz kuyruğa eklendi, daha sonra kontrol edin" gibi bir yanıt hemen göndermek isterseniz), `await` kullanmazsınız ve buradan hemen bir yanıt dönersiniz.
+    // Ancak şu anki senaryoda, işlem bitince doğrudan dosyayı indirtmek istediğimiz için handler'ın beklemesi gerekiyor.
+    try {
+        // Görevi kuyruğa ekle ve tamamlanmasını bekle
+        await processingQueue.add(() => processAudioTask(req, res));
+        // Görev (processAudioTask) tamamlandığında zaten yanıtı (res.send vb.) göndermiş olacaktır.
+        // Bu satıra ulaşıldığında yanıt zaten gönderilmiş demektir.
+        console.log('Merge isteği kuyrukta işlendi ve yanıt gönderildi.');
+
+    } catch (error) {
+        // *** Hata Yakalama ve Yanıt Gönderme ***
+        // İşlem sırasında bir hata oluşursa burası çalışır (FFmpeg hatası, dosya okuma hatası vb.).
+        console.error(`[${timestamp}] İşlem sırasında hata oluştu:`, error);
+        // Yanıt daha önce gönderilmemişse (örneğin, bir hata yanıtı veya başarılı yanıt zaten gönderilmişse), hata yanıtı gönder.
+        // Bu kontrol, aynı isteğe birden fazla kez yanıt gönderilmesini önler.
+        if (!res.headersSent) {
+             // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
+             // error objesi FFmpeg stderr çıktısını içerebilir (error.stderr)
+             res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
+        } else {
+             console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
+        }
+
+
+    } finally {
+        // *** Geçici Dosyaları Temizleme ***
+        // try veya catch bloğu tamamlandıktan sonra (işlem başarılı veya başarısız olsa da) burası her zaman çalışır.
+        console.log(`[${timestamp}] Geçici dosyalar temizleniyor...`);
+        // filesToClean listesindeki her dosya için silme işlemi yap
+        for (const file of filesToClean) {
+            try {
+                // Dosya yolunun geçerli olup olmadığını kontrol edin.
+                if (file) {
+                    // Dosyayı silmeye çalış. await kullanıyoruz.
+                    // Silme işlemi dosya mevcut değilse veya izin yoksa hata fırlatacaktır.
+                    await fs.unlink(file);
+                    console.log(`[${timestamp}] Temizlendi: ${file}`);
+                } else {
+                     console.log(`[${timestamp}] Tanımsız geçici dosya yolu atlandı.`);
+                }
+            } catch (e) {
+                // Silme işlemi hata verirse (dosya yoksa, izin yoksa vb.) logla ama devam et.
+                // Dosyanın zaten silinmiş olması ('ENOENT' hatası) yaygın bir durumdur (örn: önceki bir hata dosyanın oluşturulmasını engellemiş olabilir).
+                if (e.code === 'ENOENT') { // 'ENOENT' hatası dosyanın mevcut olmadığı anlamına gelir
+                     console.log(`[${timestamp}] Geçici dosya zaten yoktu veya silinmişti: ${file}`);
+                }
