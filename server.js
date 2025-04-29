@@ -31,12 +31,14 @@ const upload = multer({ dest: os.tmpdir() }).fields([
     { name: 'file6', maxCount: 1 }
 ]);
 
-// *** Kuyruk Yapılandırması ***
+// *** Performans İçin CPU Sayısını Kullanma ve Kuyruk Yapılandırması ***
+// Sistemdeki mevcut mantıksal CPU çekirdek sayısını alın.
+const numCPUs = os.cpus().length;
+console.log(`Sistemde ${numCPUs} CPU çekirdeği algılandı.`);
+
 // Maksimum kaç ses işleminin (FFmpeg çalıştırma) aynı anda çalışacağını belirleyin.
-// Bu değer sunucunuzun CPU çekirdek sayısına, RAM'ine ve bir görevin ortalama ne kadar sürdüğüne bağlıdır.
-// Çok yüksek değerler sistemi aşırı yükleyebilir, çok düşük değerler ise beklemeyi artırır.
-// Başlangıç için sunucunuzun çekirdek sayısına yakın bir değer (örneğin 2, 4, 8) deneyin.
-const processingQueue = new PQueue({ concurrency: 4 }); // Eşzamanlılık limiti: 4 olarak ayarlandı
+// Bunu algılanan CPU çekirdek sayısına ayarlamak genellikle iyi bir başlangıç noktasıdır.
+const processingQueue = new PQueue({ concurrency: numCPUs }); // Eşzamanlılık limiti CPU sayısına ayarlandı
 console.log(`Ses işleme kuyruğu oluşturuldu, maksimum ${processingQueue.concurrency} işlem aynı anda çalışacak.`);
 
 
@@ -111,8 +113,9 @@ async function processAudioTask(req, res) {
             filesToClean.push(normalizedOutputFilePath); // Oluşacak çıktı dosyasını temizlik listesine ekle
 
             // FFmpeg komutu: Tek dosyayı loudnorm filtresi ile normalize et ve MP3'e kodla
-            // hedef LUFS parametresini kullanır
-            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir)
+            // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan
+            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -preset ultrafast -threads ${numCPUs} -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
             console.log(`[${timestamp}] FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
             const { stdout, stderr } = await execPromise(normalizeCommand); // FFmpeg komutunu çalıştır ve bekle
             console.log(`[${timestamp}] FFmpeg normalize stdout:`, stdout);
@@ -201,13 +204,15 @@ async function processAudioTask(req, res) {
                  console.log(`[${timestamp}] Concat/Normalize (>2 dosya, sessizlik dahil): ${filterComplex}`);
             }
 
-            // --- FFmpeg komutunu oluşturmaya devam et ---
+            // --- Nihai FFmpeg komutunu oluştur ---
             // -y: çıktı dosyasının üzerine sormadan yaz
+            // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir)
+            // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan
             // -filter_complex: yukarıda oluşturulan dizeyi kullan
             // -map "[out]": filter_complex çıktısını (`[out]` olarak etiketlenen) çıktı dosyasına eşle
             // -c:a libmp3lame: ses kodeği (MP3)
             // -b:a 192k: ses bit hızı
-            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            const ffmpegCommand = `ffmpeg -y -preset ultrafast -threads ${numCPUs} ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
 
             console.log(`[${timestamp}] FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
 
@@ -252,6 +257,7 @@ async function processAudioTask(req, res) {
         if (!res.headersSent) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
              // FFmpeg hatalarının stderr çıktısı logda var, kullanıcıya detay vermeden genel bir hata mesajı daha güvenlidir.
+             // error objesi FFmpeg stderr çıktısını içerebilir (error.stderr)
              res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
              // Debug için hatanın detayını göndermek isterseniz (dikkatli kullanın!):
              // res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
