@@ -113,9 +113,13 @@ async function processAudioTask(req, res) {
             filesToClean.push(normalizedOutputFilePath); // Oluşacak çıktı dosyasını temizlik listesine ekle
 
             // FFmpeg komutu: Tek dosyayı loudnorm filtresi ile normalize et ve MP3'e kodla
-            // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir)
-            // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan
-            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -preset ultrafast -threads ${numCPUs} -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            // -y: çıktı dosyasının üzerine sormadan yaz
+            // -i: girdi dosyası
+            // -filter:a: ses filtresi (loudnorm)
+            // -c:a: ses kodeği (libmp3lame)
+            // -b:a: ses bit hızı
+            // *** -preset ve -threads çıktı dosyasından önceye taşındı ***
+            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k -preset ultrafast -threads ${numCPUs} "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
             console.log(`[${timestamp}] FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
             const { stdout, stderr } = await execPromise(normalizeCommand); // FFmpeg komutunu çalıştır ve bekle
             console.log(`[${timestamp}] FFmpeg normalize stdout:`, stdout);
@@ -206,13 +210,13 @@ async function processAudioTask(req, res) {
 
             // --- Nihai FFmpeg komutunu oluştur ---
             // -y: çıktı dosyasının üzerine sormadan yaz
-            // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir)
-            // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan
+            // -i [girdiler]: tüm girdi dosyaları
             // -filter_complex: yukarıda oluşturulan dizeyi kullan
             // -map "[out]": filter_complex çıktısını (`[out]` olarak etiketlenen) çıktı dosyasına eşle
             // -c:a libmp3lame: ses kodeği (MP3)
             // -b:a 192k: ses bit hızı
-            const ffmpegCommand = `ffmpeg -y -preset ultrafast -threads ${numCPUs} ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            // *** -preset ve -threads çıktı dosyasından önceye taşındı ***
+            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k -preset ultrafast -threads ${numCPUs} "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
 
             console.log(`[${timestamp}] FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
 
@@ -256,10 +260,10 @@ async function processAudioTask(req, res) {
         // Bu kontrol, aynı isteğe birden fazla kez yanıt gönderilmesini önler.
         if (!res.headersSent) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
-             // FFmpeg hatalarının stderr çıktısı logda var, kullanıcıya detay vermeden genel bir hata mesajı daha güvenlidir.
              // error objesi FFmpeg stderr çıktısını içerebilir (error.stderr)
              res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
              // Debug için hatanın detayını göndermek isterseniz (dikkatli kullanın!):
+             // FFmpeg çıktısını görmek hatanın sebebini anlamada çok yardımcı olur.
              // res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
         } else {
              // Hata oluştu ancak yanıt zaten gönderilmişti (örn: belki dosya okuma hatası yanıtı gönderildi sonra temizlik hatası oldu).
@@ -320,7 +324,7 @@ app.post('/merge', upload, async (req, res) => {
         console.log('Merge isteği kuyrukta işlendi ve yanıt gönderildi.');
 
     } catch (error) {
-        // Bu catch bloğu, sadece görevin kuyruğa eklenmesi sırasında veya kuyruğun kendisiyle ilgili çok nadir hataları yakalar.
+        // Bu catch blokları genellikle kuyrukla ilgili nadir hataları veya görevin eklenmesi sırasında oluşabilecek hataları yakalar.
         // İşlem (FFmpeg çalıştırma vb.) sırasında oluşan hatalar `processAudioTask` içindeki catch'te yakalanır ve orası yanıtı gönderir.
          console.error('Kuyruk yönetimi sırasında beklenmedik hata:', error);
          // Eğer yanıt henüz gönderilmemişse (normalde processAudioTask hata verseydi gönderilmiş olurdu), genel bir hata yanıtı gönder.
