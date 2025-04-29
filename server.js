@@ -6,6 +6,7 @@ const path = require('path'); // Dosya ve dizin yolları ile çalışmak için y
 const os = require('os'); // İşletim sistemiyle ilgili yardımcı program (tmpdir gibi)
 const { exec } = require('child_process'); // Harici komutları çalıştırmak için (ffmpeg gibi)
 const util = require('util'); // Node.js dahili API'leri için yardımcı program
+const PQueue = require('p-queue'); // İstekleri sıraya almak için kütüphane - YENİ EKLENDİ
 
 // child_process.exec'i async/await ile kullanmak için Promise'e dönüştürün
 const execPromise = util.promisify(exec);
@@ -28,225 +29,289 @@ const upload = multer({ dest: os.tmpdir() }).fields([
     { name: 'file6', maxCount: 1 }
 ]);
 
-// Dosyaları birleştirmek için POST uç noktasını tanımlayın
-// Bu uç nokta, sunucunun temel URL'sine göre /merge olacaktır.
-// 'upload' middleware'i, async işleyici çalışmadan önce gelen multipart/form-data'yı işleyecektir.
+// *** Kuyruk Yapılandırması ***
+// Maksimum kaç ses işleminin (FFmpeg çalıştırma) aynı anda çalışacağını belirleyin.
+// Bu değer sunucunuzun CPU çekirdek sayısına, RAM'ine ve bir görevin ortalama ne kadar sürdüğüne bağlıdır.
+// Çok yüksek değerler sistemi aşırı yükleyebilir, çok düşük değerler ise beklemeyi artırır.
+// Başlangıç için sunucunuzun çekirdek sayısına yakın bir değer (örneğin 2, 4, 8) deneyin.
+const processingQueue = new PQueue({ concurrency: 4 }); // Eşzamanlılık limiti: 4 olarak ayarlandı
+console.log(`Ses işleme kuyruğu oluşturuldu, maksimum ${processingQueue.concurrency} işlem aynı anda çalışacak.`);
+
+
+// *** Ses işleme mantığının tamamını içeren asenkron fonksiyon ***
+// Bu fonksiyon, bir kuyruk görevi olarak çalışacak ve kendisine verilen Express yanıt nesnesini (res) kullanarak yanıtı gönderecek.
+async function processAudioTask(req, res) {
+    // Her istek için benzersiz bir ID veya zaman damgası oluşturun, logları takip etmek için faydalı olur.
+    const timestamp = Date.now();
+    console.log(`[${timestamp}] İşlem kuyruktan alındı, başlıyor.`);
+
+    // İstekten gelen parametreleri al
+    // req.body Multer tarafından zaten doldurulmuştur
+    const outputFilenameFromRequest = req.body.outputFilename;
+    // silenceDuration ve targetLufs parametrelerini al, geçerli sayı değilse varsayılanı kullan
+    const silenceDuration = parseFloat(req.body.silenceDuration) || 1;
+    const targetLufs = parseFloat(req.body.targetLufs) || -16;
+
+    console.log(`[${timestamp}] İstek Parametreleri: Çıktı Adı: ${outputFilenameFromRequest}, Sessizlik: ${silenceDuration}sn, Hedef LUFS: ${targetLufs}`);
+
+
+    const uploadedFields = req.files; // Multer'ın işlediği dosya alanları
+    const validPaths = []; // İşlenecek geçerli dosya yollarının sıralı listesi (Multer geçici yolları)
+    const uploadedFileDetails = {}; // Orijinal dosya bilgilerini saklar (geçici yola göre eşlenmiş)
+    const allTempFilePaths = []; // Temizlik için tüm geçici yollar (Multer'ın oluşturduğu)
+
+    // Multer'ın oluşturduğu geçici dosya yollarını topla ve sıralamayı koru
+    for (let i = 1; i <= 6; i++) {
+        const fieldName = `file${i}`;
+        // Alanın gönderilmemesi durumunda isteğe bağlı zincirleme (?.) kullanarak mevcut alanın dosya dizisine erişin.
+        const fileArray = uploadedFields?.[fieldName];
+
+        if (fileArray && fileArray.length > 0) {
+            const file = fileArray[0]; // maxCount 1 olduğu için dizi 1 elemanlı olacaktır
+            validPaths.push(file.path); // İşlenecek dosya listesine geçici yolu ekle
+            allTempFilePaths.push(file.path); // Temizlik için listeye ekle
+            uploadedFileDetails[file.path] = { // Orijinal bilgileri sakla
+                originalname: file.originalname,
+                mimetype: file.mimetype
+            };
+             console.log(`[${timestamp}] Alan '${fieldName}' için dosya yüklendi (Sıra: ${validPaths.length}): ${file.path}, Original: ${file.originalname}`);
+        } else {
+             console.log(`[${timestamp}] Alan '${fieldName}' için dosya yüklenmedi.`);
+        }
+    }
+
+    let normalizedOutputFilePath = null; // FFmpeg'in oluşturacağı çıktı dosyasının yolu
+    // Temizlik listesi: Başlangıçta sadece Multer'ın oluşturduğu geçici dosyalar var.
+    // İşlem sırasında FFmpeg'in oluşturacağı çıktı dosyası da bu listeye eklenecek.
+    const filesToClean = [...allTempFilePaths];
+    const tmpDir = os.tmpdir(); // Sistem geçici dizini
+
+
+    try {
+        if (validPaths.length === 0) {
+            const errorMsg = "Lütfen işlenecek en az bir adet dosya yükleyin.";
+            console.error(`[${timestamp}] Hata: ${errorMsg}`);
+            // Hata yanıtı gönder. Yanıt daha önce gönderilmemişse emin ol.
+            if (!res.headersSent) {
+                return res.status(400).send(errorMsg);
+            } else {
+                console.warn(`[${timestamp}] Hata oluştu ancak yanıt zaten gönderilmişti.`);
+                return; // Yanıt gönderildiği için fonksiyondan çık
+            }
+
+
+        } else if (validPaths.length === 1) {
+            // Durum 1: Sadece 1 dosya yüklendi. Birleştirme yok, sadece normalize et.
+            console.log(`[${timestamp}] Sadece 1 dosya yüklendi, normalize ediliyor: ${validPaths[0]}`);
+            const singleFilePath = validPaths[0];
+            // Normalize edilmiş çıktı dosyasının yolunu belirle
+            normalizedOutputFilePath = path.join(tmpDir, `normalized_audio_${timestamp}.mp3`);
+            filesToClean.push(normalizedOutputFilePath); // Oluşacak çıktı dosyasını temizlik listesine ekle
+
+            // FFmpeg komutu: Tek dosyayı loudnorm filtresi ile normalize et ve MP3'e kodla
+            // hedef LUFS parametresini kullanır
+            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+            console.log(`[${timestamp}] FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
+            const { stdout, stderr } = await execPromise(normalizeCommand); // FFmpeg komutunu çalıştır ve bekle
+            console.log(`[${timestamp}] FFmpeg normalize stdout:`, stdout);
+            if (stderr) { console.warn(`[${timestamp}] FFmpeg normalize stderr:`, stderr); }
+            console.log(`[${timestamp}] FFmpeg normalize komutu tamamlandı.`);
+
+            // Oluşan normalized çıktı dosyasını oku
+            const singleFileBinary = await fs.readFile(normalizedOutputFilePath);
+            const originalDetails = uploadedFileDetails[singleFilePath] || { originalname: 'single_audio.mp3' };
+
+            // İndirme için çıktı dosya adını belirle
+            let finalFilename;
+            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string') {
+                 // İstekten gelen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
+                finalFilename = outputFilenameFromRequest.replace(/[^a-zA-Z0-9_\-.]/g, '') || 'normalized_audio'; // İzin verilmeyen karakterleri kaldır
+                if (!finalFilename.toLowerCase().endsWith('.mp3')) {
+                    finalFilename += '.mp3';
+                }
+            } else {
+                 // İstenen ad yoksa varsayılanı kullan (orijinal ad + normalized_)
+                finalFilename = `normalized_${originalDetails.originalname}`;
+                 // Varsayılan adda da .mp3 yoksa ekle
+                if (!finalFilename.toLowerCase().endsWith('.mp3')) {
+                    finalFilename += '.mp3';
+                }
+            }
+
+            // HTTP başlıklarını ayarla ve normalize edilmiş dosyayı yanıt olarak gönder
+            res.setHeader('Content-Type', 'audio/mpeg'); // Çıktı MP3
+            res.setHeader('Content-Disposition', `attachment; filename="${finalFilename}"`); // İndirme adı
+            res.setHeader('Content-Length', singleFileBinary.length);
+
+            res.status(200).send(singleFileBinary); // Dosya içeriğini gönder
+            console.log(`[${timestamp}] Normalize edilmiş tek dosya gönderildi. Ad: ${finalFilename}`);
+
+        } else {
+            // Durum 2: 2 veya daha fazla dosya yüklendi (Intro + TTS'ler). Birleştirme ve normalizasyon yap.
+            console.log(`[${timestamp}] ${validPaths.length} dosya yüklendi, birleştirme ve normalizasyon yapılıyor.`);
+
+            // Birleştirilmiş/normalize edilmiş çıktı dosyasının yolunu belirle
+            normalizedOutputFilePath = path.join(tmpDir, `normalized_merged_audio_${timestamp}.mp3`);
+            filesToClean.push(normalizedOutputFilePath); // Oluşacak çıktı dosyasını temizlik listesine ekle
+
+            // --- FFmpeg komutunu oluşturun: Intro -> TTS1 -> Silence -> TTS2 -> Silence ... ---
+            // Her dosya için giriş argümanlarını (-i "yol") oluşturun
+            const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
+
+            // Sessizlik kaynağı filtresi, istenen süreyi kullanır
+            const silenceFilterSource = `aevalsrc=0:s=44100:d=${silenceDuration}[silence_out];`;
+
+            // Concat filtresi girişlerini oluşturun: [0:a][1:a][silence_out][2:a][silence_out]...[N-1:a]
+            // validPaths.length >= 2 olduğunu zaten biliyoruz (aksi takdirde üstteki else if çalışırdı)
+            let concatInputPads = '[0:a][1:a]'; // Intro ([0:a]) ve ilk TTS ([1:a]) her zaman yan yana birleşir
+            // Eğer 2'den fazla dosya varsa (yani en az 3 dosya varsa, index 2'den başlar), kalan TTS'ler arasına sessizlik ekle
+            for (let i = 2; i < validPaths.length; i++) {
+                concatInputPads += `[silence_out][${i}:a]`; // Silence -> Sonraki TTS
+            }
+
+            // Concat filtresine toplam giriş sayısı = Toplam ses akışı sayısı + Eklenen sessizlik akışı sayısı
+            // Sessizlik akışı sayısı: validPaths.length >= 2 ise (Intro ve en az bir TTS varsa) Intro ile ilk TTS arasına sessizlik koymuyoruz.
+            // Geriye kalan validPaths.length - 1 adet segmentin (İlk TTS, ikinci TTS...) arasına (validPaths.length - 2) adet sessizlik bloğu eklenir.
+            // validPaths.length == 2 ise (Intro + TTS1), 2-2 = 0 sessizlik. Toplam giriş 2 (audio).
+            // validPaths.length == 3 ise (Intro + TTS1 + TTS2), 3-2 = 1 sessizlik. Toplam giriş 3 (audio) + 1 (silence) = 4.
+            // validPaths.length == N ise, N-2 adet sessizlik. Toplam giriş N (audio) + (N-2) (silence) = 2N - 2 ? Hayır, akışları sayıyoruz:
+            // [0:a] [1:a] [silence_out] [2:a] [silence_out] ... [silence_out] [N-1:a]
+            // N adet audio akışı + (N-2) adet silence akışı (N>=2 için). Toplam N + Math.max(0, N-2).
+            const numberOfSilenceInputs = Math.max(0, validPaths.length - 2); // Intro ile ilk TTS arasına sessizlik koymadığımız için
+            const totalConcatInputs = validPaths.length + numberOfSilenceInputs;
+
+
+            // Concat filtresini oluşturun (n= toplam giriş sayısı)
+            const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`;
+
+            // Loudnorm filtresini oluşturun, hedef LUFS parametresini kullanır
+            const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Hedef LUFS kullanılıyor
+
+            // Tüm filtreleri birleştirin (filter_complex dizesi)
+            const filterComplex = `${silenceFilterSource}${concatFilter}${loudnormFilter}`;
+
+            // Nihai FFmpeg komutunu oluşturun
+            // -y: çıktı dosyasının üzerine sormadan yaz
+            // -filter_complex: birden çok filtreyi zincirle
+            // -map "[out]": filter_complex çıktısını (`[out]` olarak etiketlenen) çıktı dosyasına eşle
+            // -c:a libmp3lame: ses kodeği (MP3)
+            // -b:a 192k: ses bit hızı
+            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
+
+            console.log(`[${timestamp}] FFmpeg birleştirme ve normalizasyon komutu çalıştırılıyor: ${ffmpegCommand}`);
+
+            // FFmpeg komutunu çalıştır ve bekle
+            const { stdout, stderr } = await execPromise(ffmpegCommand);
+            console.log(`[${timestamp}] FFmpeg stdout:`, stdout);
+            if (stderr) { console.warn(`[${timestamp}] FFmpeg stderr:`, stderr); }
+            console.log(`[${timestamp}] FFmpeg birleştirme ve normalizasyon komutu tamamlandı.`);
+
+            // Oluşan birleştirilmiş/normalize edilmiş çıktı dosyasını oku
+            const outputBinary = await fs.readFile(normalizedOutputFilePath);
+            console.log(`[${timestamp}] Birleştirilmiş ve normalize edilmiş çıktı dosyası okundu: ${normalizedOutputFilePath}`);
+
+            // İndirme için çıktı dosya adını belirle: İstekten gelen adı kullan veya varsayılanı oluştur
+            let finalFilename;
+            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string') {
+                 // İstenen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
+                finalFilename = outputFilenameFromRequest.replace(/[^a-zA-Z0-9_\-.]/g, '') || 'merged_audio'; // İzin verilmeyen karakterleri kaldır
+                 if (!finalFilename.toLowerCase().endsWith('.mp3')) {
+                    finalFilename += '.mp3';
+                }
+            } else {
+                // İstenen ad yoksa varsayılanı kullan (merged_audio_timestamp)
+                finalFilename = `merged_audio_${timestamp}.mp3`;
+            }
+
+            // HTTP başlıklarını ayarla ve birleştirilmiş/normalize edilmiş dosyayı yanıt olarak gönder
+            res.setHeader('Content-Type', 'audio/mpeg'); // Çıktı MP3
+            res.setHeader('Content-Disposition', `attachment; filename="${finalFilename}"`); // İndirme adı
+            res.setHeader('Content-Length', outputBinary.length);
+
+            res.status(200).send(outputBinary); // Dosya içeriğini gönder
+            console.log(`[${timestamp}] Birleştirilmiş ve normalize edilmiş dosya gönderildi. Ad: ${finalFilename}`);
+        }
+
+    } catch (error) {
+        // *** Hata Yakalama ve Yanıt Gönderme ***
+        // İşlem sırasında bir hata oluşursa burası çalışır.
+        console.error(`[${timestamp}] İşlem sırasında hata oluştu:`, error);
+        // Yanıt daha önce gönderilmemişse (örneğin, bir hata yanıtı veya başarılı yanıt zaten gönderilmemişse), hata yanıtı gönder.
+        // Bu kontrol, yanıtın sadece bir kez gönderilmesini sağlar.
+        if (!res.headersSent) {
+             // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
+             res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
+             // Debug için hatanın detayını göndermek isterseniz: res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}`);
+        } else {
+             // Hata oluştu ancak yanıt zaten gönderilmişti (örn: belki dosya okuma hatası yanıtı gönderildi sonra temizlik hatası oldu).
+             console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti.`);
+        }
+
+
+    } finally {
+        // *** Geçici Dosyaları Temizleme ***
+        // try veya catch bloğu tamamlandıktan sonra (işlem başarılı veya başarısız olsa da) burası her zaman çalışır.
+        console.log(`[${timestamp}] Geçici dosyalar temizleniyor...`);
+        // filesToClean listesindeki her dosya için silme işlemi yap
+        for (const file of filesToClean) {
+            try {
+                // Dosya yolunun geçerli olup olmadığını kontrol edin ve dosyanın mevcut olup olmadığını kontrol edin.
+                // fs.existsSync senkron bir metod olduğu için performans kritik yollarda dikkatli kullanın.
+                // Daha güvenli bir kontrol, silme işleminin kendisinin hata fırlatıp fırlatmadığını kontrol etmektir.
+                if (file) {
+                    // Dosyayı silmeye çalış
+                    await fs.unlink(file);
+                    console.log(`[${timestamp}] Temizlendi: ${file}`);
+                } else {
+                     console.log(`[${timestamp}] Tanımsız geçici dosya yolu atlandı.`);
+                }
+            } catch (e) {
+                // Silme işlemi hata verirse (dosya yoksa, izin yoksa vb.) logla ama devam et.
+                // Dosyanın zaten silinmiş olması yaygın bir durumdur (örn: önceki bir hata dosyanın oluşturulmasını engellemiş olabilir).
+                if (e.code === 'ENOENT') { // 'ENOENT' hatası dosyanın mevcut olmadığı anlamına gelir
+                     console.log(`[${timestamp}] Geçici dosya zaten yoktu veya silinmişti: ${file}`);
+                } else {
+                    console.warn(`[${timestamp}] Geçici dosya temizlenemedi (muhtemelen izin hatası veya başka sebep): ${file}. Hata: ${e.message}`);
+                }
+            }
+        }
+        console.log(`[${timestamp}] Geçici dosyalar temizleme tamamlandı.`);
+        console.log(`[${timestamp}] İşlem tamamlandı.`);
+    }
+}
+
+
+// *** Birleştirme POST Uç Noktası ***
+// Bu handler sadece gelen isteği alır, Multer ile dosyaları işler ve asıl işleme görevini kuyruğa ekler.
+// Asıl işleme ve yanıt gönderme `processAudioTask` içinde gerçekleşir.
 app.post('/merge', upload, async (req, res) => {
-    console.log('Merge isteği alındı.');
+    console.log('Merge isteği alındı, kuyruğa ekleniyor.');
 
-    // req.body, dosya alanlarının yanı sıra diğer metin alanlarını (Multer fields() kullandığında) içerir
-    const outputFilenameFromRequest = req.body.outputFilename; // İstekten gelen çıktı dosya adı alanı
-    console.log('İstenen çıktı dosya adı:', outputFilenameFromRequest);
+    // İstek işleme görevini kuyruğa ekle.
+    // `processAudioTask` fonksiyonunu bir lambda/arrow fonksiyonu içine sarmak önemlidir: `() => processAudioTask(req, res)`
+    // Bu şekilde `processAudioTask` fonksiyonu hemen çalıştırılmaz, sadece kuyruğa eklenir.
+    // Kuyruk uygun olduğunda (concurrency limitine göre) bu fonksiyonu çalıştıracaktır.
+    // `await processingQueue.add(...)` satırı, bu Express handler'ının görevin kuyrukta işlenip **tamamlanmasını** beklemesini sağlar.
+    // Eğer beklemek istemiyorsanız (örneğin "işleminiz kuyruğa eklendi, daha sonra kontrol edin" gibi bir yanıt hemen göndermek isterseniz), `await` kullanmazsınız.
+    // Ancak şu anki senaryoda, işlem bitince doğrudan dosyayı indirtmek istediğimiz için beklemek gerekiyor.
+    try {
+        // Görevi kuyruğa ekle ve tamamlanmasını bekle
+        await processingQueue.add(() => processAudioTask(req, res));
+        // Görev tamamlandığında processAudioTask zaten yanıtı göndermiş olacaktır.
+        console.log('Merge isteği kuyrukta işlendi ve yanıt gönderildi.');
 
-    // req.files, anahtarların alan adları olduğu bir nesneyi (file1, file2 vb.)
-    // ve değerlerin o alan için yüklenen dosya nesnelerini içeren diziler olduğu bir nesneyi içerir.
-    const uploadedFields = req.files;
-
-    // Gerçekten yüklenmiş ve geçerli olan dosya yollarını depolamak için dizi
-    const validPaths = [];
-    // Yüklenen dosyaların ayrıntılarını (orijinal adı ve mime türü gibi), geçici yollarına göre eşleyerek depolamak için nesne.
-    const uploadedFileDetails = {};
-
-    // Temizleme için TÜM yüklenen geçici dosya yollarını toplamak için dizi.
-    const allTempFilePaths = [];
-
-    // Sırayı korumak için beklenen alan adları (file1'den file6'ya) üzerinde döngü yapın
-    for (let i = 1; i <= 6; i++) {
-        const fieldName = `file${i}`;
-        // Alanın gönderilmemesi durumunda isteğe bağlı zincirleme (?.) kullanarak mevcut alanın dosya dizisine erişin.
-        const fileArray = uploadedFields?.[fieldName];
-
-        // Dosya dizisinin var olup olmadığını ve en az bir dosya içerip içermediğini kontrol edin (maxCount 1 olduğu için 0 veya 1 eleman içerecektir).
-        if (fileArray && fileArray.length > 0) {
-            const file = fileArray[0]; // Diziden tek dosya nesnesini alın
-            validPaths.push(file.path); // İşlenecek dosya listesine geçici yolu ekleyin (birleştirilecek veya tek olarak döndürülecek)
-            allTempFilePaths.push(file.path); // Daha sonra temizlemek için listeye geçici yolu ekleyin
-            uploadedFileDetails[file.path] = { // Geçici yola göre eşlenmiş orijinal ayrıntıları depolayın
-                originalname: file.originalname,
-                mimetype: file.mimetype
-            };
-            console.log(`Alan '${fieldName}' için dosya yüklendi (Sıra: ${validPaths.length}): ${file.path}, Original: ${file.originalname}`);
-        } else {
-            console.log(`Alan '${fieldName}' için dosya yüklenmedi.`);
-        }
-    }
-
-    // Temizlenmesi gereken tüm geçici dosyaların yollarını tutmak için dizi.
-    // Yüklenen tüm geçici dosyalarla başlayın.
-    let normalizedOutputFilePath = null; // Nihai normalize edilmiş çıktı dosyasının yolunu tutmak için değişken
-    const filesToClean = [...allTempFilePaths]; // Yüklenen dosya yolları dizisini kopyalayın
-
-    // Sistemin geçici dizin yolunu alın.
-    const tmpDir = os.tmpdir();
-
-    try {
-        if (validPaths.length === 0) {
-            // Durum 1: Hiçbir dosya başarıyla yüklenmedi
-            const errorMsg = "Lütfen işlenecek en az bir adet dosya yükleyin.";
-            console.error(errorMsg);
-            // 400 Bad Request yanıtı döndürün
-            return res.status(400).send(errorMsg);
-
-        } else if (validPaths.length === 1) {
-            // Durum 2: Tam olarak bir dosya yüklendi. Normalize ettikten sonra doğrudan döndürün.
-            console.log(`Sadece 1 dosya yüklendi, normalize ediliyor: ${validPaths[0]}`);
-            const singleFilePath = validPaths[0];
-            const timestamp = Date.now();
-            // Geçici dizindeki normalize edilmiş çıktı dosyası için yolu tanımlayın
-            normalizedOutputFilePath = path.join(tmpDir, `normalized_audio_${timestamp}.mp3`);
-            filesToClean.push(normalizedOutputFilePath); // Çıktı dosyasını temizleme listesine ekleyin
-
-            // loudnorm filtresini kullanarak tek dosyayı normalize edin, MP3 olarak çıktı alın
-            // İşletim sisteminden bağımsız olarak FFmpeg komutu için posix yolları kullanın
-            // loudnorm I değeri -16'ya düşürüldü
-            const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm=I=-16:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`; // MP3 için bitrate eklendi
-            console.log(`FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
-            const { stdout, stderr } = await execPromise(normalizeCommand);
-            console.log('FFmpeg normalize stdout:', stdout);
-            if (stderr) { console.warn('FFmpeg normalize stderr:', stderr); }
-            console.log('FFmpeg normalize komutu tamamlandı.');
-
-            // Normalize edilmiş dosyanın ikili içeriğini okuyun
-            const singleFileBinary = await fs.readFile(normalizedOutputFilePath);
-
-            // Geçici yolu kullanarak orijinal ayrıntıları (adı, mime türü) alın
-            const originalDetails = uploadedFileDetails[singleFilePath] || { originalname: 'single_audio.mp3' };
-
-            // Çıktı dosya adını belirle: İstekten gelen adı kullan veya varsayılanı oluştur
-            let finalFilename;
-            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string') {
-                // İstenen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
-                finalFilename = outputFilenameFromRequest.replace(/[^a-zA-Z0-9_\-.]/g, '') || 'normalized_audio'; // İzin verilmeyen karakterleri kaldır
-                if (!finalFilename.toLowerCase().endsWith('.mp3')) {
-                    finalFilename += '.mp3';
-                }
-            } else {
-                // İstenen ad yoksa varsayılanı kullan
-                finalFilename = `normalized_${originalDetails.originalname}`;
-                // Varsayılan adda da .mp3 yoksa ekle
-                if (!finalFilename.toLowerCase().endsWith('.mp3')) {
-                    finalFilename += '.mp3';
-                }
-            }
-
-
-            // Dosya indirme için HTTP yanıt başlıklarını ayarlayın
-            res.setHeader('Content-Type', 'audio/mpeg'); // MP3 olarak yeniden kodladığımız için MP3 olarak ayarlayın
-            res.setHeader('Content-Disposition', `attachment; filename="${finalFilename}"`); // İndirme için bir dosya adı önerin
-            res.setHeader('Content-Length', singleFileBinary.length); // İçerik uzunluğunu ayarlayın
-
-            // Normalize edilmiş dosyanın ikili içeriğini 200 OK durumuyla gönderin
-            res.status(200).send(singleFileBinary);
-            console.log(`Normalize edilmiş tek dosya gönderildi. Ad: ${finalFilename}`);
-
-        } else {
-            // Durum 3: 2 veya daha fazla dosya yüklendi. FFmpeg concat filtresi + sessizlik + normalizasyon ile birleştirmeye devam edin.
-            console.log(`${validPaths.length} dosya yüklendi, ilk dosya sonrası 1sn sessizlik eklenip birleştirme ve normalizasyon yapılıyor.`);
-            const timestamp = Date.now(); // Benzersiz dosya adları için bir zaman damgası kullanın
-
-            // Geçici dizindeki nihai normalize edilmiş ve birleştirilmiş çıktı dosyası için yolu tanımlayın
-            normalizedOutputFilePath = path.join(tmpDir, `normalized_merged_audio_${timestamp}.mp3`);
-            filesToClean.push(normalizedOutputFilePath); // Çıktı dosyasını temizleme listesine ekleyin
-
-            // --- Sessizlik içeren concat filtresini kullanarak FFmpeg komutunu oluşturun ---
-            // Her dosya için giriş argümanlarını (-i "yol") oluşturun
-            const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
-
-            // 1 saniye sessizlik kaynağı: aevalsrc=0:s=SampleRate:d=Duration
-            // Yaygın bir örnekleme hızı kullanılıyor (44100). Loudnorm yeniden örneklemeyi halletmeli.
-            const silenceFilterSource = `aevalsrc=0:s=44100:d=1[silence_out];`; // 1s sessizlik üretir, çıktıyı [silence_out] olarak etiketler
-
-            // İlk ses girişinden [0:a] sonra sessizliği içeren concat filtresi için giriş eşlemesini oluşturun
-            // Concat'a girişler şunlar olacaktır: [0:a], [silence_out], [1:a], [2:a], ...
-            const concatInputPads = [
-                '[0:a]', // İlk ses girişi
-                '[silence_out]', // aevalsrc'den gelen sessizlik çıktısı
-                ...validPaths.slice(1).map((_, index) => `[${index + 1}:a]`) // Kalan ses girişleri ([1:a], [2:a], ...)
-            ].join('');
-
-            // Concat filtresine toplam giriş sayısı = ses dosyası sayısı + 1 (sessizlik için)
-            const totalConcatInputs = validPaths.length + 1;
-
-            // Concat filtresini oluşturun: N+1 giriş alır, 0 video, 1 ses çıktı verir, sesi [a] olarak etiketler
-            const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`;
-
-            // Loudnorm filtresini oluşturun: [a] girişini alır, loudnorm uygular, çıktıyı [out] olarak etiketler
-            // loudnorm I değeri -16'ya düşürüldü
-            const loudnormFilter = '[a]loudnorm=I=-16:TP=-1.0:LRA=11[out]'; // Standart loudnorm parametreleri (I değeri değiştirildi)
-
-            // Tüm filtreleri filter_complex dizesinde birleştirin
-            const filterComplex = `${silenceFilterSource}${concatFilter}${loudnormFilter}`;
-
-            // Her şeyi nihai FFmpeg komutunda birleştirin
-            // -y: Çıktı dosyasının üzerine sormadan yaz
-            // -map "[out]": "[out]" olarak etiketlenen çıktı akışını (loudnorm sonucu) çıktı dosyasına eşle
-            // -c:a libmp3lame: Sesi libmp3lame kullanarak MP3'e yeniden kodla (güvenilir çıktı formatı)
-            // -b:a 192k: Ses bit hızını 192kbps olarak ayarla (MP3 ses için yaygın bir ayar)
-            const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
-
-            console.log(`FFmpeg birleştirme (1sn sessizlik) ve normalizasyon komutu çalıştırılıyor: ${ffmpegCommand}`);
-
-            // FFmpeg komutunu çalıştırın
-            const { stdout, stderr } = await execPromise(ffmpegCommand);
-            console.log('FFmpeg stdout:', stdout);
-            if (stderr) { console.warn('FFmpeg stderr:', stderr); }
-            console.log('FFmpeg birleştirme ve normalizasyon komutu tamamlandı.');
-
-            // Nihai çıktı dosyasının ikili içeriğini okuyun
-            const outputBinary = await fs.readFile(normalizedOutputFilePath);
-            console.log(`Birleştirilmiş ve normalize edilmiş çıktı dosyası okundu: ${normalizedOutputFilePath}`);
-
-            // Çıktı dosya adını belirle: İstekten gelen adı kullan veya varsayılanı oluştur
-            let finalFilename;
-            if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string') {
-                // İstenen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
-                finalFilename = outputFilenameFromRequest.replace(/[^a-zA-Z0-9_\-.]/g, '') || 'merged_audio'; // İzin verilmeyen karakterleri kaldır
-                if (!finalFilename.toLowerCase().endsWith('.mp3')) {
-                    finalFilename += '.mp3';
-                }
-            } else {
-                // İstenen ad yoksa varsayılanı kullan
-                finalFilename = `merged_audio_${timestamp}.mp3`;
-            }
-
-
-            // Nihai çıktı dosyası için indirme adı olarak ayarlanacak dosya adını tanımlayın.
-            res.setHeader('Content-Type', 'audio/mpeg'); // Çıktı MP3
-            res.setHeader('Content-Disposition', `attachment; filename="${finalFilename}"`); // Belirlenen adı kullan
-            res.setHeader('Content-Length', outputBinary.length);
-
-            // Nihai dosyanın ikili içeriğini 200 OK durumuyla gönderin
-            res.status(200).send(outputBinary);
-            console.log(`Birleştirilmiş ve normalize edilmiş dosya gönderildi. Ad: ${finalFilename}`);
-        }
-
-    } catch (error) {
-        // try bloğunda oluşan herhangi bir hatayı yakalayın (dosya işlemleri, FFmpeg yürütme vb.)
-        console.error("İşlem sırasında hata oluştu:", error);
-        // Hata mesajıyla birlikte 500 Internal Server Error yanıtı gönderin
-        // Üretim ortamında, daha genel bir mesaj göndermek ve belirli hatayı sunucu tarafında kaydetmek isteyebilirsiniz
-        res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}`);
-    } finally {
-        // Bu blok, try bloğunun başarılı olup olmamasından veya catch bloğunun yürütülmesinden bağımsız olarak çalışır.
-        // Geçici dosyaların temizlenmesini sağlamak için burada kullanılır.
-        console.log("Geçici dosyalar temizleniyor...");
-        for (const file of filesToClean) {
-            try {
-                // Dosya yolunun geçerli olup olmadığını kontrol edin (null veya undefined değil)
-                if (file) {
-                    await fs.unlink(file); // Dosyayı silmeye çalışın
-                    console.log(`Temizlendi: ${file}`);
-                }
-            } catch (e) {
-                // Bir dosya için temizleme başarısız olursa bir uyarı kaydet (örneğin, önceki bir hata nedeniyle dosya mevcut olmayabilir)
-                console.warn(`Temizlenemedi (muhtemelen yok): ${file}. Hata: ${e.message}`);
-            }
-        }
-        console.log("Geçici dosyalar temizleme tamamlandı.");
-    }
+    } catch (error) {
+        // Bu catch bloğu çoğunlukla `queue.add` sırasında oluşabilecek çok nadir hataları yakalar.
+        // İşlem (FFmpeg çalıştırma vb.) sırasında oluşan hatalar `processAudioTask` içindeki catch'te yakalanır.
+         console.error('Kuyruk yönetimi sırasında beklenmedik hata:', error);
+         // Eğer yanıt henüz gönderilmemişse (normalde processAudioTask hata verseydi gönderilmiş olurdu), bir hata yanıtı gönder.
+         if (!res.headersSent) {
+             res.status(500).send('İşlem kuyruğa eklenirken veya yönetilirken bir hata oluştu.');
+         }
+    }
 });
 
-// Express sunucusunu başlatın ve tanımlanan portta dinlemesini sağlayın.
+// Sunucuyu başlat
 app.listen(port, () => {
     console.log(`Ses birleştirme servisi ${port} portunda çalışıyor`);
 });
