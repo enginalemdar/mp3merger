@@ -53,7 +53,7 @@ async function processAudioTask(req, res) {
     // İstekten gelen parametreleri al (Multer'dan sonra req.body dolu gelir)
     const outputFilenameFromRequest = req.body.outputFilename;
     // silenceDuration ve targetLufs parametrelerini al, geçerli sayı değilse varsayılanı kullan
-    const silenceDuration = parseFloat(req.body.silenceDuration) || 1;
+    const silenceDuration = parseFloat(req.body.silenceDuration) || 1; // BURADA DOĞRU YAZILMIŞ
     const targetLufs = parseFloat(req.body.targetLufs) || -16;
 
     console.log(`[${timestamp}] İstek Parametreleri: Çıktı Adı: ${outputFilenameFromRequest || '(Belirtilmedi)'}, Sessizlik: ${silenceDuration}sn, Hedef LUFS: ${targetLufs}`);
@@ -183,7 +183,8 @@ async function processAudioTask(req, res) {
 
             // Sessizlik akışını tanımla ve hedef formata dönüştür
             // aevalsrc -> apan -> [silence_final]
-            const silenceFilterSource = `aevalsrc=0:s=${targetSampleRate}:d=${sililenceDuration}[silence_raw];[silence_raw]apan=c=${targetChannelLayout}[silence_final];`;
+            // *** DİKKAT: Yazım hatası düzeltildi: sililenceDuration -> silenceDuration ***
+            const silenceFilterSource = `aevalsrc=0:s=${targetSampleRate}:d=${silenceDuration}[silence_raw];[silence_raw]apan=c=${targetChannelLayout}[silence_final];`; // YAZIM HATASI DÜZELTİLDİ
 
 
             if (validPaths.length === 2) {
@@ -339,7 +340,6 @@ app.post('/merge', upload, async (req, res) => {
         // Bu catch blokları genellikle kuyrukla ilgili nadir hataları veya görevin eklenmesi sırasında oluşabilecek hataları yakalar.
         // İşlem (FFmpeg çalıştırma vb.) sırasında oluşan hatalar `processAudioTask` içindeki catch'te yakalanır ve orası yanıtı gönderir.
          console.error('Kuyruk yönetimi sırasında beklenmedik hata:', error);
-         // Eğer yanıt henüz gönderilmemişse (normalde processAudioTask hata verseydi gönderilmiş olurdu), genel bir hata yanıtı gönder.
          if (!res.headersSent) {
              res.status(500).send('İşlem kuyruğa eklenirken veya yönetilirken bir hata oluştu.');
          }
