@@ -38,7 +38,7 @@ console.log(`Sistemde ${numCPUs} CPU çekirdeği algılandı.`);
 
 // Maksimum kaç ses işleminin (FFmpeg çalıştırma) aynı anda çalışacağını belirleyin.
 // Bunu algılanan CPU çekirdek sayısına ayarlamak genellikle iyi bir başlangıç noktasıdır.
-const processingQueue = new PQueue({ concurrency: numCPUs }); // Eşzamanlılık limiti CPU sayısına ayarlandı
+const processingQueue = new PQueue({ concurrency: 1 }); // Test için concurrency 1 yapıldı
 console.log(`Ses işleme kuyruğu oluşturuldu, maksimum ${processingQueue.concurrency} işlem aynı anda çalışacak.`);
 
 
