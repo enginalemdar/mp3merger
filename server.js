@@ -53,7 +53,7 @@ async function processAudioTask(req, res) {
     // İstekten gelen parametreleri al (Multerdan sonra req.body dolu gelir)
     const outputFilenameFromRequest = req.body.outputFilename;
     // silenceDuration ve targetLufs parametrelerini al, geçerli sayı değilse varsayılanı kullan
-    const silenceDuration = parseFloat(req.body.silenceDuration) || 1; // BURADA DOĞRU YAZILMIŞ
+    const silenceDuration = parseFloat(req.body.silenceDuration) || 1;
     const targetLufs = parseFloat(req.body.targetLufs) || -16;
 
     console.log(`[${timestamp}] İstek Parametreleri: Çıktı Adı: ${outputFilenameFromRequest || '(Belirtilmedi)'}, Sessizlik: ${silenceDuration}sn, Hedef LUFS: ${targetLufs}`);
@@ -170,43 +170,45 @@ async function processAudioTask(req, res) {
 
             // *** FFmpeg filter_complex dizesini oluştur ***
             let filterComplex;
-            let concatInputPads = ''; // Concat filtresine girdi olarak verilecek pad'lerin listesi
-            let totalConcatInputs; // Concat'ın 'n' parametresi
+            let concatInputPads = ''; // Concat filtresine girdi olarak verilecek padlerin listesi
+            let totalConcatInputs; // Concatin 'n' parametresi
 
-            // Hedef örnekleme hızını 44100 Hz yapıyoruz. Kanal düzeni için apan'ı kaldırıyoruz, concat'ın denemesini bekliyoruz.
+            // Hedef örnekleme hızını 44100 Hz yapıyoruz. Kanal düzeni için apan'ı kaldırıyoruz, concatın denemesini bekliyoruz.
             const targetSampleRate = 44100;
-            // const targetChannelLayout = 'stereo'; // Bu artık kullanılmıyor
+            // targetChannelLayout artık kullanılmıyor
 
             // 1. Tüm girdi ses akışlarını hedef örnekleme hızına dönüştüren filtreleri tanımla
             // Her girdi [i:a] -> aresample -> [in_i]
-            // *** apan=c=stereo kaldırıldı *** -- Bu satırda hala apan var! Hata burada!
-            const resampleFilters = validPaths.map((_, i) => `[${i}:a]aresample=${targetSampleRate},apan=c=${targetChannelLayout}[in${i}]`).join(';');
+            // *** apan=c=stereo KALDIRILDI *** <-- DİKKAT: Bu satırda apan OLMAMALI!
+            const resampleFilters = validPaths.map((_, i) => `[${i}:a]aresample=${targetSampleRate}[in${i}]`).join(';'); // APAN KALDIRILDI BURADAN
 
             // Sessizlik akışını tanımla (hedef örnekleme hızında, varsayılan mono)
             // aevalsrc -> [silence]
-            // *** apan=c=stereo kaldırıldı, etiket [silence] olarak değiştirildi karışmaması için *** -- Bu satırda da apan var! Hata burada!
-            const silenceFilterSource = `aevalsrc=0:s=${targetSampleRate}:d=${silenceDuration}[silence_raw];[silence_raw]apan=c=${targetChannelLayout}[silence_final];`;
+            // *** apan=c=stereo KALDIRILDI, etiket [silence] olarak değiştirildi *** <-- DİKKAT: Bu satırda da apan OLMAMALI!
+            const silenceFilterSource = `aevalsrc=0:s=${targetSampleRate}:d=${silenceDuration}[silence];`; // APAN KALDIRILDI BURADAN DA
 
 
             if (validPaths.length === 2) {
                  // Sadece 2 dosya (Intro + TTS1): Sessizliğe gerek yok, sadece resample edilmiş girdileri birleştir ve normalize et.
-                 // Concat'a sadece resample edilmiş girdi pad'leri ([in0], [in1]) gider.
+                 // Concat'a sadece resample edilmiş girdi padleri ([in0], [in1]) gider.
                  concatInputPads = '[in0][in1]';
-                 totalConcatInputs = 2; // Concat'ın 2 girişi var
+                 totalConcatInputs = 2; // Concatin 2 girişi var
 
                  const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
                  const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
                  // filter_complex: Tüm resample filtreleri -> concat -> loudnorm
+                 // Sessizlik kaynağı yok
                  filterComplex = `${resampleFilters};${concatFilter}${loudnormFilter}`;
 
                  console.log(`[${timestamp}] Filter Complex (2 dosya, resampled, sessizliksiz): ${filterComplex}`);
 
             } else { // validPaths.length > 2 (Intro + TTS1 + TTS2 + ...): Sessizlik gerekli
                  // Concat girişleri: [in0][in1] (resample edilmiş Intro + TTS1)
-                 // ardından kalan resample edilmiş TTSler arasına [silence_final][in_i] ekle
+                 // ardından kalan resample edilmiş TTSler arasına [silence][in_i] ekle
+                 // *** silence_final -> silence olarak değiştirildi *** <-- DİKKAT: buradaki silence pad adı, silenceFilterSource'taki etiketle AYNİ OLMALI!
                  concatInputPads = '[in0][in1]';
                  for (let i = 2; i < validPaths.length; i++) {
-                     concatInputPads += `[silence_final][in${i}]`; // Sessizlik akışı -> Sonraki resample edilmiş TTS akışı (index i)
+                     concatInputPads += `[silence][in${i}]`; // Sessizlik akışı ([silence]) -> Sonraki resample edilmiş TTS akışı ([in_i])
                  }
 
                  // Concat filtresine toplam giriş sayısı = Resample edilmiş audio akış sayısı + Eklenen sessizlik akışı sayısı
@@ -216,7 +218,7 @@ async function processAudioTask(req, res) {
 
                  const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
                  const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
-                 // filter_complex: Sessizlik kaynağı ve dönüşümü -> Tüm resample filtreleri -> concat -> loudnorm
+                 // filter_complex: Sessizlik kaynağı -> Tüm resample filtreleri -> concat -> loudnorm
                  filterComplex = `${silenceFilterSource}${resampleFilters};${concatFilter}${loudnormFilter}`; // Semicolon bağımsız zincirleri ayırır
 
                  console.log(`[${timestamp}] Filter Complex (>2 dosya, resampled, sessizlik dahil): ${filterComplex}`);
@@ -277,9 +279,7 @@ async function processAudioTask(req, res) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
              // error objesi FFmpeg stderr çıktısını içerebilir (error.stderr)
              res.status(500).send(`Dosyalar işlenirken bir hata oluştu. Lütfen yüklediğiniz dosyaları kontrol edin veya farklı ayarlar deneyin.`);
-             // Debug için hatanın detayını göndermek isterseniz (dikkatli kullanın!):
-             // FFmpeg çıktısını görmek hatanın sebebini anlamada çok yardımcı olur.
-             // res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
+             // Debug için: res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
         } else {
              console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
         }
