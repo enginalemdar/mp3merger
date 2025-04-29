@@ -136,7 +136,7 @@ async function processAudioTask(req, res) {
             if (outputFilenameFromRequest && typeof outputFilenameFromRequest === 'string' && outputFilenameFromRequest.trim().length > 0) {
                  // İstekten gelen adı kullan, basitçe güvenli hale getir ve .mp3 uzantısını ekle/koru
                 finalFilename = outputFilenameFromRequest.trim().replace(/[^a-zA-Z0-9_\-.]/g, '') || 'normalized_audio'; // İzin verilmeyen karakterleri kaldır, boş kalırsa varsayılan
-                if (!finalFilename.toLowerCase().endsWith('.mp3')) {
+                 if (!finalFilename.toLowerCase().endsWith('.mp3')) {
                     finalFilename += '.mp3';
                 }
             } else {
@@ -173,11 +173,11 @@ async function processAudioTask(req, res) {
             let concatInputPads = ''; // Concat filtresine girdi olarak verilecek pad'lerin listesi
             let totalConcatInputs; // Concat'ın 'n' parametresi
 
-            // 1. Tüm girdi ses akışlarını ve sessizlik akışını hedef formata (44100Hz stereo) dönüştüren filtreleri tanımla
             // Hedef örnekleme hızını 44100 Hz ve hedef kanal düzenini stereo yapıyoruz.
             const targetSampleRate = 44100;
             const targetChannelLayout = 'stereo';
 
+            // 1. Tüm girdi ses akışlarını hedef formata (44100Hz stereo) dönüştüren filtreleri tanımla
             // Her girdi [i:a] -> aresample/apan -> [in_i]
             const resampleFilters = validPaths.map((_, i) => `[${i}:a]aresample=${targetSampleRate},apan=c=${targetChannelLayout}[in${i}]`).join(';');
 
@@ -270,7 +270,7 @@ async function processAudioTask(req, res) {
         // *** Hata Yakalama ve Yanıt Gönderme ***
         // İşlem sırasında bir hata oluşursa burası çalışır (FFmpeg hatası, dosya okuma hatası vb.).
         console.error(`[${timestamp}] İşlem sırasında hata oluştu:`, error);
-        // Yanıt daha önce gönderilmemişse (örneğin, bir hata yanıtı veya başarılı yanıt zaten gönderilmemişse), hata yanıtı gönder.
+        // Yanıt daha önce gönderilmemişse (örneğin, bir hata yanıtı veya başarılı yanıt zaten gönderilmişse), hata yanıtı gönder.
         // Bu kontrol, aynı isteğe birden fazla kez yanıt gönderilmesini önler.
         if (!res.headersSent) {
              // Kullanıcıya genel bir hata mesajı gönder. Detayları loglamak daha güvenlidir.
