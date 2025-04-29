@@ -118,7 +118,8 @@ async function processAudioTask(req, res) {
             // -filter:a: ses filtresi (loudnorm)
             // -c:a: ses kodeği (libmp3lame)
             // -b:a: ses bit hızı
-            // *** -preset ve -threads çıktı dosyasından önceye taşındı ***
+            // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir) - çıktıdan önce olmalı
+            // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan - çıktıdan önce olmalı
             const normalizeCommand = `ffmpeg -y -i "${singleFilePath.replace(/\\/g, '/')}" -filter:a loudnorm=I=${targetLufs}:TP=-1.0:LRA=11 -c:a libmp3lame -b:a 192k -preset ultrafast -threads ${numCPUs} "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
             console.log(`[${timestamp}] FFmpeg normalize komutu çalıştırılıyor: ${normalizeCommand}`);
             const { stdout, stderr } = await execPromise(normalizeCommand); // FFmpeg komutunu çalıştır ve bekle
@@ -167,45 +168,56 @@ async function processAudioTask(req, res) {
             // Her dosya için giriş argümanlarını (-i "yol") oluşturun
             const inputArgs = validPaths.map(filePath => `-i "${filePath.replace(/\\/g, '/')}"`).join(' ');
 
-            // *** FFmpeg filter_complex dizesini validPaths.length'e göre koşullu olarak oluştur ***
+            // *** FFmpeg filter_complex dizesini oluştur ***
             let filterComplex;
-            let concatInputPads = '';
-            let totalConcatInputs;
+            let concatInputPads = ''; // Concat filtresine girdi olarak verilecek pad'lerin listesi
+            let totalConcatInputs; // Concat'ın 'n' parametresi
+
+            // 1. Tüm girdi ses akışlarını ve sessizlik akışını hedef formata (44100Hz stereo) dönüştüren filtreleri tanımla
+            // Hedef örnekleme hızını 44100 Hz ve hedef kanal düzenini stereo yapıyoruz.
+            const targetSampleRate = 44100;
+            const targetChannelLayout = 'stereo';
+
+            // Her girdi [i:a] -> aresample/apan -> [in_i]
+            const resampleFilters = validPaths.map((_, i) => `[${i}:a]aresample=${targetSampleRate},apan=c=${targetChannelLayout}[in${i}]`).join(';');
+
+            // Sessizlik akışını tanımla ve hedef formata dönüştür
+            // aevalsrc -> apan -> [silence_final]
+            const silenceFilterSource = `aevalsrc=0:s=${targetSampleRate}:d=${sililenceDuration}[silence_raw];[silence_raw]apan=c=${targetChannelLayout}[silence_final];`;
+
 
             if (validPaths.length === 2) {
-                 // Sadece 2 dosya (Intro + TTS1): Sessizliğe gerek yok, sadece birleştir ve normalize et.
-                 // aevalsrc filtresine veya [silence_out] pimine gerek yok.
-                 concatInputPads = '[0:a][1:a]'; // İlk iki dosyanın ses akışları
-                 totalConcatInputs = 2; // Concat'a 2 giriş var
+                 // Sadece 2 dosya (Intro + TTS1): Sessizliğe gerek yok, sadece resample edilmiş girdileri birleştir ve normalize et.
+                 // Concat'a sadece resample edilmiş girdi pad'leri ([in0], [in1]) gider.
+                 concatInputPads = '[in0][in1]';
+                 totalConcatInputs = 2; // Concat'ın 2 girişi var
 
                  const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
                  const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
-                 filterComplex = `${concatFilter}${loudnormFilter}`; // filter_complex sadece concat ve loudnorm içerir
+                 // filter_complex: Tüm resample filtreleri -> concat -> loudnorm
+                 filterComplex = `${resampleFilters};${concatFilter}${loudnormFilter}`;
 
-                 console.log(`[${timestamp}] Concat/Normalize (2 dosya, sessizliksiz): ${filterComplex}`);
+                 console.log(`[${timestamp}] Filter Complex (2 dosya, resampled, sessizliksiz): ${filterComplex}`);
 
             } else { // validPaths.length > 2 (Intro + TTS1 + TTS2 + ...): Sessizlik gerekli
-                 // Sessizlik kaynağı filtresi, istenen süreyi kullanır
-                 const silenceFilterSource = `aevalsrc=0:s=44100:d=${silenceDuration}[silence_out];`;
-
-                 // Concat filtresi girişlerini oluşturun: [0:a][1:a] (Intro + TTS1)
-                 // ardından kalan TTS'ler arasına [silence_out][i:a] ekle
-                 concatInputPads = '[0:a][1:a]';
+                 // Concat girişleri: [in0][in1] (resample edilmiş Intro + TTS1)
+                 // ardından kalan resample edilmiş TTS'ler arasına [silence_final][in_i] ekle
+                 concatInputPads = '[in0][in1]';
                  for (let i = 2; i < validPaths.length; i++) {
-                     concatInputPads += `[silence_out][${i}:a]`; // Silence -> Sonraki TTS (index i)
+                     concatInputPads += `[silence_final][in${i}]`; // Sessizlik akışı -> Sonraki resample edilmiş TTS akışı (index i)
                  }
 
-                 // Concat filtresine toplam giriş sayısı = Toplam ses akışı sayısı + Eklenen sessizlik akışı sayısı
-                 // Sessizlik akışı sayısı: validPaths.length >= 2 ise (Intro + en az bir TTS varsa)
-                 // Intro ile ilk TTS arasına sessizlik koymuyoruz. Geriye kalan (validPaths.length - 1) segmentin arasına (validPaths.length - 2) adet sessizlik bloğu eklenir.
-                 const numberOfSilenceInputs = validPaths.length - 2; // Sessizlik [1:a] ile [2:a], [2:a] ile [3:a], ..., [N-2:a] ile [N-1:a] arasına konur.
-                 totalConcatInputs = validPaths.length + numberOfSilenceInputs; // Toplam giriş sayısı = Ses akışları + Sessizlik akışları
+                 // Concat filtresine toplam giriş sayısı = Resample edilmiş audio akış sayısı + Eklenen sessizlik akışı sayısı
+                 // Eklenen sessizlik akışı sayısı = validPaths.length >= 2 ise (validPaths.length - 2) (Intro ile ilk TTS arasına sessizlik koymadığımız için)
+                 const numberOfSilenceInputs = validPaths.length - 2;
+                 totalConcatInputs = validPaths.length + numberOfSilenceInputs; // Toplam giriş sayısı = Resample edilmiş audio akışları + Sessizlik akışları
 
                  const concatFilter = `${concatInputPads}concat=n=${totalConcatInputs}:v=0:a=1[a];`; // Concact filtresi
                  const loudnormFilter = `[a]loudnorm=I=${targetLufs}:TP=-1.0:LRA=11[out]`; // Loudnorm filtresi
-                 filterComplex = `${silenceFilterSource}${concatFilter}${loudnormFilter}`; // filter_complex sessizlik kaynağını da içerir
+                 // filter_complex: Sessizlik kaynağı ve dönüşümü -> Tüm resample filtreleri -> concat -> loudnorm
+                 filterComplex = `${silenceFilterSource}${resampleFilters};${concatFilter}${loudnormFilter}`; // Semicolon bağımsız zincirleri ayırır
 
-                 console.log(`[${timestamp}] Concat/Normalize (>2 dosya, sessizlik dahil): ${filterComplex}`);
+                 console.log(`[${timestamp}] Filter Complex (>2 dosya, resampled, sessizlik dahil): ${filterComplex}`);
             }
 
             // --- Nihai FFmpeg komutunu oluştur ---
@@ -215,7 +227,8 @@ async function processAudioTask(req, res) {
             // -map "[out]": filter_complex çıktısını (`[out]` olarak etiketlenen) çıktı dosyasına eşle
             // -c:a libmp3lame: ses kodeği (MP3)
             // -b:a 192k: ses bit hızı
-            // *** -preset ve -threads çıktı dosyasından önceye taşındı ***
+            // -preset ultrafast: En yüksek kodlama hızı için (kaliteden ödün verebilir) - çıktıdan önce olmalı
+            // -threads numCPUs: Mevcut tüm CPU çekirdeklerini kullan - çıktıdan önce olmalı
             const ffmpegCommand = `ffmpeg -y ${inputArgs} -filter_complex "${filterComplex}" -map "[out]" -c:a libmp3lame -b:a 192k -preset ultrafast -threads ${numCPUs} "${normalizedOutputFilePath.replace(/\\/g, '/')}"`;
 
             console.log(`[${timestamp}] FFmpeg komutu çalıştırılıyor: ${ffmpegCommand}`);
@@ -266,7 +279,6 @@ async function processAudioTask(req, res) {
              // FFmpeg çıktısını görmek hatanın sebebini anlamada çok yardımcı olur.
              // res.status(500).send(`Dosyalar işlenirken bir hata oluştu: ${error.message}. FFmpeg stderr: ${error.stderr}`);
         } else {
-             // Hata oluştu ancak yanıt zaten gönderilmişti (örn: belki dosya okuma hatası yanıtı gönderildi sonra temizlik hatası oldu).
              console.warn(`[${timestamp}] İşlem hatası oluştu ancak yanıt zaten gönderilmişti. İstek ID: ${timestamp}`);
         }
 
@@ -337,4 +349,7 @@ app.post('/merge', upload, async (req, res) => {
 // Sunucuyu başlat
 app.listen(port, () => {
     console.log(`Ses birleştirme servisi ${port} portunda çalışıyor`);
+    const numCPUs = os.cpus().length; // Sunucu başlarken CPU sayısını tekrar logla
+    console.log(`Sistemde ${numCPUs} CPU çekirdeği algılandı.`);
+    console.log(`Ses işleme kuyruğu ${processingQueue.concurrency} concurrency ile çalışıyor.`);
 });
